@@ -21,8 +21,31 @@ type Proxy struct {
 	core         *transactionUser
 }
 
+type proxyConfig struct {
+	registrar *Registrar
+}
+
+// ProxyOption customises the behaviour of a Proxy during construction.
+type ProxyOption func(*proxyConfig)
+
+// WithRegistrar wires the provided Registrar into the proxy so that REGISTER
+// requests are handled locally instead of being forwarded upstream.
+func WithRegistrar(registrar *Registrar) ProxyOption {
+	return func(cfg *proxyConfig) {
+		cfg.registrar = registrar
+	}
+}
+
 // NewProxy constructs and starts a stateful SIP proxy.
-func NewProxy() *Proxy {
+func NewProxy(opts ...ProxyOption) *Proxy {
+	cfg := &proxyConfig{}
+	for _, opt := range opts {
+		if opt == nil {
+			continue
+		}
+		opt(cfg)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 
 	clientIn := make(chan *Message, 32)
@@ -46,7 +69,7 @@ func NewProxy() *Proxy {
 
 	proxy.transport = newTransportLayer(clientIn, serverIn, clientOut, serverOut, transportToTxn, txnToTransport)
 	proxy.transactions = newTransactionLayer(transportToTxn, txnToTransport, txnToTU, tuToTxn)
-	proxy.core = newTransactionUser(txnToTU, tuToTxn)
+	proxy.core = newTransactionUser(txnToTU, tuToTxn, cfg.registrar)
 
 	proxy.transport.start(ctx)
 	proxy.transactions.start(ctx)

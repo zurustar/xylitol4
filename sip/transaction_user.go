@@ -12,13 +12,14 @@ import (
 )
 
 type transactionUser struct {
-	events  <-chan tuEvent
-	actions chan<- tuAction
-	wg      sync.WaitGroup
+	events    <-chan tuEvent
+	actions   chan<- tuAction
+	registrar *Registrar
+	wg        sync.WaitGroup
 }
 
-func newTransactionUser(events <-chan tuEvent, actions chan<- tuAction) *transactionUser {
-	return &transactionUser{events: events, actions: actions}
+func newTransactionUser(events <-chan tuEvent, actions chan<- tuAction, registrar *Registrar) *transactionUser {
+	return &transactionUser{events: events, actions: actions, registrar: registrar}
 }
 
 func (t *transactionUser) start(ctx context.Context) {
@@ -51,6 +52,19 @@ func (t *transactionUser) handleEvent(ctx context.Context, event tuEvent) {
 			return
 		}
 		req := event.Message.Clone()
+		if t.registrar != nil && strings.EqualFold(req.Method, "REGISTER") {
+			if resp, handled := t.registrar.handleRegister(ctx, req); handled {
+				if resp != nil {
+					action := tuAction{
+						Kind:       tuActionSendResponse,
+						ServerTxID: event.ServerTxID,
+						Message:    resp,
+					}
+					t.sendAction(ctx, action)
+				}
+				return
+			}
+		}
 		branch := newBranchID()
 		prependVia(req, branch)
 		decrementMaxForwards(req)

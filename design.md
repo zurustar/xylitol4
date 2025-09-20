@@ -138,6 +138,27 @@ directory entries for logging/validation, and keeps the handle available for the
 transaction user. This guarantees that future registrar features can rely on the
 database being available before any network traffic is processed.
 
+## Registrar Behaviour
+
+The proxy embeds an optional registrar that can be supplied at construction time
+(`sip.WithRegistrar`). When configured, the transaction user intercepts
+`REGISTER` requests and handles them locally instead of forwarding them
+upstream. The registrar authenticates clients using HTTP Digest credentials
+fetched from the user database, challenges unauthenticated requests with a 401
+`WWW-Authenticate` header, and replies with 403 for invalid credentials.
+
+Successful registrations update an in-memory contact binding table keyed by the
+Address of Record. Each binding tracks the contact URI and its expiry, honouring
+per-contact `expires` parameters or the global `Expires` header with a sensible
+default. Responses include the active bindings along with a freshly minted `To`
+tag so retransmissions can be matched correctly. Wildcard contacts with
+`Expires: 0` clear all bindings for the user.
+
+The registrar exposes the stored bindings through `BindingsFor`, which the unit
+tests use to verify state transitions. The command-line proxy automatically
+constructs a registrar backed by the SQLite user store, ensuring REGISTER
+traffic is validated and recorded without involving the upstream server.
+
 ## Command Entrypoint
 
 The `cmd/sip-proxy` package wires the proxy to real UDP sockets so it can run as a
