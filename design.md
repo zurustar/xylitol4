@@ -116,6 +116,28 @@ layer. Unexpected responses are dropped. These choices keep the state machines
 robust while remaining faithful to the behaviour required by RFC 3261 for a
 stateful proxy.
 
+## User Directory and Registrar Data
+
+Registrar-facing logic requires access to user credentials and registered
+contact URIs. To keep this data source encapsulated, the `sip/userdb` package
+wraps a SQLite database behind a small `SQLiteStore` that exposes read-only
+helpers (`Lookup` and `AllUsers`). The store constrains the driver to a single
+connection so that it remains safe for concurrent use by the proxy while still
+surfacing a standard `database/sql` handle for schema initialisation in tests.
+
+Unit tests avoid CGO by relying on a pure Go, in-memory SQLite driver
+implemented in `sqlite_driver.go`. The driver registers itself as
+`sql.Register("sqlite", ...)`, supports `CREATE TABLE`, `INSERT`, and `SELECT`
+statements, and applies very small SQL parsing helpers tailored to the schema
+used by the proxy. This keeps the test suite hermetic while exercising the same
+query paths the production proxy uses.
+
+The command-line entrypoint now requires a `--user-db` flag that points to the
+SQLite datasource. On startup the proxy opens the store, eagerly loads all
+directory entries for logging/validation, and keeps the handle available for the
+transaction user. This guarantees that future registrar features can rely on the
+database being available before any network traffic is processed.
+
 ## Command Entrypoint
 
 The `cmd/sip-proxy` package wires the proxy to real UDP sockets so it can run as a
