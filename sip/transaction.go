@@ -34,27 +34,37 @@ type tuAction struct {
 	Message    *Message
 }
 
-type serverTransactionState int
-
-type serverTransaction struct {
+type transactionData struct {
 	id           string
 	branch       string
 	method       string
-	state        serverTransactionState
 	request      *Message
 	lastResponse *Message
 }
 
-type clientTransactionState int
+type serverTransaction interface {
+	data() *transactionData
+	onSendResponse(status int)
+}
 
-type clientTransaction struct {
-	id           string
-	branch       string
-	method       string
-	state        clientTransactionState
-	request      *Message
-	lastResponse *Message
-	serverTxID   string
+type clientTransaction interface {
+	data() *transactionData
+	onReceiveResponse(status int) bool
+	serverID() string
+}
+
+func newServerTransactionForMethod(method string, data *transactionData) serverTransaction {
+	if strings.EqualFold(method, "INVITE") {
+		return newInviteServerTransaction(data)
+	}
+	return newNonInviteServerTransaction(data)
+}
+
+func newClientTransactionForMethod(method string, data *transactionData, serverTxID string) clientTransaction {
+	if strings.EqualFold(method, "INVITE") {
+		return newInviteClientTransaction(data, serverTxID)
+	}
+	return newNonInviteClientTransaction(data, serverTxID)
 }
 
 type transactionLayer struct {
@@ -63,8 +73,8 @@ type transactionLayer struct {
 	toTU          chan<- tuEvent
 	fromTU        <-chan tuAction
 
-	serverTxns map[string]*serverTransaction
-	clientTxns map[string]*clientTransaction
+	serverTxns map[string]serverTransaction
+	clientTxns map[string]clientTransaction
 
 	wg sync.WaitGroup
 }
@@ -75,8 +85,8 @@ func newTransactionLayer(fromTransport <-chan transportEvent, toTransport chan<-
 		toTransport:   toTransport,
 		toTU:          toTU,
 		fromTU:        fromTU,
-		serverTxns:    make(map[string]*serverTransaction),
-		clientTxns:    make(map[string]*clientTransaction),
+		serverTxns:    make(map[string]serverTransaction),
+		clientTxns:    make(map[string]clientTransaction),
 	}
 }
 
@@ -133,19 +143,19 @@ func (t *transactionLayer) handleRequest(ctx context.Context, evt transportEvent
 	method := strings.ToUpper(req.Method)
 	key := transactionKey(branch, method)
 	if existing, ok := t.serverTxns[key]; ok {
-		if existing.lastResponse != nil {
-			resp := existing.lastResponse.Clone()
+		if data := existing.data(); data != nil && data.lastResponse != nil {
+			resp := data.lastResponse.Clone()
 			t.sendToTransport(ctx, transportEvent{Direction: directionDownstream, Message: resp})
 		}
 		return
 	}
-	txn := &serverTransaction{
+	txnData := &transactionData{
 		id:      key,
 		branch:  branch,
 		method:  method,
-		state:   0,
 		request: req.Clone(),
 	}
+	txn := newServerTransactionForMethod(method, txnData)
 	t.serverTxns[key] = txn
 	event := tuEvent{
 		Kind:       tuEventRequest,
@@ -170,17 +180,15 @@ func (t *transactionLayer) handleResponse(ctx context.Context, evt transportEven
 	if !ok {
 		return
 	}
-	txn.lastResponse = resp.Clone()
-	status := resp.StatusCode
-	if status < 200 {
-		txn.state = 1
-	} else {
-		txn.state = 2
+	if data := txn.data(); data != nil {
+		data.lastResponse = resp.Clone()
+	}
+	if txn.onReceiveResponse(resp.StatusCode) {
 		delete(t.clientTxns, key)
 	}
 	event := tuEvent{
 		Kind:       tuEventResponse,
-		ServerTxID: txn.serverTxID,
+		ServerTxID: txn.serverID(),
 		ClientTxID: key,
 		Message:    resp.Clone(),
 	}
@@ -205,14 +213,13 @@ func (t *transactionLayer) handleTUAction(ctx context.Context, action tuAction) 
 		if key == "" {
 			key = transactionKey(branch, method)
 		}
-		txn := &clientTransaction{
-			id:         key,
-			branch:     branch,
-			method:     method,
-			state:      0,
-			request:    action.Message.Clone(),
-			serverTxID: action.ServerTxID,
+		txnData := &transactionData{
+			id:      key,
+			branch:  branch,
+			method:  method,
+			request: action.Message.Clone(),
 		}
+		txn := newClientTransactionForMethod(method, txnData, action.ServerTxID)
 		t.clientTxns[key] = txn
 		t.sendToTransport(ctx, transportEvent{Direction: directionUpstream, Message: action.Message.Clone()})
 	case tuActionSendResponse:
@@ -224,21 +231,10 @@ func (t *transactionLayer) handleTUAction(ctx context.Context, action tuAction) 
 			return
 		}
 		resp := action.Message.Clone()
-		txn.lastResponse = resp.Clone()
-		status := resp.StatusCode
-		if status < 200 {
-			txn.state = 0
-		} else {
-			if txn.method == "INVITE" {
-				if status >= 200 && status < 300 {
-					txn.state = 3
-				} else {
-					txn.state = 2
-				}
-			} else {
-				txn.state = 3
-			}
+		if data := txn.data(); data != nil {
+			data.lastResponse = resp.Clone()
 		}
+		txn.onSendResponse(resp.StatusCode)
 		t.sendToTransport(ctx, transportEvent{Direction: directionDownstream, Message: resp})
 	}
 }
