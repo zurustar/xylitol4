@@ -1,149 +1,91 @@
 # Design Overview
 
-This document captures the architecture and major components of the SIP server
-implementation contained in this repository. The goal of the package is to
-provide a small stateful SIP user agent server (UAS) that can negotiate and
-maintain session timers while exposing enough structure for embedding into
-larger systems.
+This document describes the stateful SIP proxy implemented in the `sip`
+package. The proxy follows RFC 3261 and focuses on providing a clean separation
+between the transport, transaction, and transaction user (TU) layers. Each
+layer owns its own goroutine and exchanges work exclusively through buffered
+queues so that they remain independently testable.
 
-## Message Model
+## Layered Architecture
 
-The `sip` package defines a single `Message` type that models both SIP requests
-and responses. Important characteristics include:
+The proxy is exposed through the `Proxy` type. Constructing a proxy wires three
+cooperating subsystems:
 
-- **Core fields** – The struct tracks whether the instance is a request via the
-  unexported `isRequest` flag and stores the method, request URI, protocol
-  version, status code, reason phrase, header map, and body payload.
-- **Construction helpers** – `NewRequest` and `NewResponse` initialise requests
-  and responses respectively. They normalise method casing, default the
-  protocol to `SIP/2.0`, and populate a header map.
-- **Cloning and inspection** – `Clone` performs a deep copy of the message and
-  `IsRequest` exposes whether an instance originated as a request.
-- **Header management** – Convenience helpers (`SetHeader`, `AddHeader`,
-  `DelHeader`, `GetHeader`, `HeaderValues`) manage canonicalised headers. The
-  implementation uses `textproto.CanonicalMIMEHeaderKey` to normalise header
-  names and always copies slices to avoid accidental sharing.
-- **Content-Length** – `EnsureContentLength` synchronises the `Content-Length`
-  header with the body prior to serialisation.
-- **Encoding** – `String` renders the message to on-the-wire text by emitting
-  the start line, sorted headers, and body. It delegates to
-  `EnsureContentLength` to guarantee a correct payload size.
+- **Transport layer** – Converts abstract "client" and "server" endpoints into
+  `Message` events. It delivers inbound datagrams to the transaction layer and
+  publishes outbound datagrams on per-direction queues. The transport layer has
+  no SIP awareness beyond cloning messages and ensuring content length headers
+  are present before sending.
+- **Transaction layer** – Implements RFC 3261 server and client transactions for
+  INVITE and non-INVITE requests. It owns the transaction state machines,
+  handles retransmissions, and decides when responses should be cached or
+  forwarded. Every interaction with neighbouring layers happens via typed
+  events, keeping the state machines decoupled from transport or TU concerns.
+- **Transaction user (proxy core)** – Represents the stateless proxy logic. It
+  receives requests/responses from the transaction layer, performs proxy
+  specific mutations (adding/removing Via headers, decrementing Max-Forwards),
+  and feeds the adjusted messages back to the transaction layer.
 
-### Parsing and Helpers
+The channel topology is `transport -> transaction -> TU -> transaction ->
+transport`, forming two ring buffers (one for control and one for media) that
+preserve ordering while preventing direct cross-layer calls.
 
-`ParseMessage` converts raw wire data to a `Message` by reading the start line
-and MIME-style headers via `textproto.Reader`. For responses the start line is
-interpreted as `SIP/<version> <status> <reason>`; for requests it parses
-`<method> <uri> <version>`. A body is read according to `Content-Length` when
-present, otherwise any remaining bytes are treated as the payload. Validation
-errors surface as `ErrInvalidMessage`.
+## Transaction Management
 
-Additional helpers simplify SIP header manipulation:
+The transaction layer maintains two maps: one for server transactions keyed by
+branch parameters from downstream requests and another for client transactions
+keyed by the branch values the proxy generates for forwarded requests. Each
+transaction captures:
 
-- `CopyHeaders` copies selected headers between messages, cloning slices.
-- `GetHeaderParam`, `replaceHeaderParam`, and `ensureHeaderParam` operate on
-  semicolon-delimited header parameters.
-- `ensureHeaderValue` guarantees a specific token exists in a comma-delimited
-  header, avoiding duplicates.
-- `FormatHeader` renders `"Name: value"` pairs using canonical casing.
+- The original request or most recent response for retransmission purposes.
+- The RFC 3261 state (`Proceeding`, `Completed`, `Confirmed`, `Terminated` for
+  INVITE server transactions; `Calling`, `Proceeding`, `Completed`,
+  `Terminated` otherwise).
+- Directional information so that responses can be emitted toward the correct
+  transport queue.
 
-These utilities underpin the server's response construction and session timer
-handling.
+Server transactions emit a TU event the first time they observe a new request
+branch. Subsequent retransmissions are intercepted and satisfied using the last
+stored response without re-invoking upper layers. Client transactions tie an
+upstream branch to the originating server transaction so that responses from
+far-end servers can be routed back to the waiting downstream transaction.
 
-## Server Architecture
+## Proxy Core Behaviour
 
-The `Server` type orchestrates SIP dialog management and request handling. Its
-notable fields are:
+The TU layer acts as a simple, always-forwarding proxy:
 
-- `dialogs` – A map from a stable dialog key to internal `dialog` records.
-- `defaultSessionInterval` – Baseline session expiration when negotiation does
-  not supply an explicit interval.
-- `contact` – Value used for the `Contact` header on responses.
-- `now` – Clock function injected via options for testing.
-- `mu` – A mutex protecting access to shared dialog state.
+1. **Requests** – When a request event arrives, the TU clones the message,
+   decrements `Max-Forwards` when present, prepends a new Via header containing a
+   freshly generated branch (prefixed with `z9hG4bK`), and instructs the
+   transaction layer to create a client transaction that forwards the request
+   upstream.
+2. **Responses** – Responses from upstream arrive with the proxy's Via header on
+   top. The TU removes that hop, leaving the next Via ready for the downstream
+   client, and tells the transaction layer to relay the response via the matched
+   server transaction.
 
-Construction uses functional options (`Option`). `WithDefaultSessionInterval`,
-`WithContact`, and `WithClock` customise behaviour while `NewServer` applies
-sane fallbacks.
+This small amount of SIP intelligence is confined to the TU, leaving both the
+transport and transaction layers unaware of proxy-specific policy.
 
-Dialog state is represented internally by the `dialog` struct (Call-ID, local
-and remote tags, session interval, refresher role, and last-update timestamp).
-A public `DialogState` mirrors this data for read-only inspection. Methods such
-as `ActiveDialogs`, `DialogState`, and `dialog.snapshot()` expose consistent
-snapshots while holding the mutex.
+## Public Surface
 
-## Request Handling Flow
+Tests interact with the proxy via four queues exposed on `Proxy`:
 
-`Handle` accepts raw UDP payload text, parses it with `ParseMessage`, and then
-delegates to `HandleMessage`. The latter acts on already parsed requests and
-selects specialised handlers based on the SIP method:
+- `SendFromClient` / `SendFromServer` enqueue messages as if they were received
+  from downstream clients or upstream servers.
+- `NextToClient` / `NextToServer` read the datagrams ready to be sent in either
+  direction.
+- `Stop` shuts down the proxy by cancelling the shared context and waiting for
+  all layer goroutines to exit.
 
-- `INVITE` → `handleInvite`
-- `BYE` → `handleBye`
-- `UPDATE` → `handleUpdate`
-- `OPTIONS` → immediate 200 OK containing capability headers
-- `ACK` → no response (ACK is hop-by-hop and terminates the transaction)
-- Any other method → 501 Not Implemented
+All APIs clone messages before handing them to other layers to avoid accidental
+sharing. Responses are rendered with up-to-date `Content-Length` headers just
+before they reach the transport layer.
 
-Each handler constructs responses via `buildResponse`, which copies mandatory
-headers (`Via`, `From`, `Call-ID`, `CSeq`) and preserves an existing `To`
-header. It also populates `Content-Length` when the body is empty.
+## Error Handling
 
-### INVITE Lifecycle
-
-`handleInvite` drives dialog creation and negotiation:
-
-1. Validates the presence of `Call-ID` and `From` tag parameters.
-2. Reuses an existing dialog when one is already tracked for the Call-ID and
-   tags; otherwise it creates a new entry, generating a local `To` tag when the
-   request omits one.
-3. Parses `Session-Expires` through `parseSessionExpires` and honours `Min-SE`
-   if no explicit interval exists. Defaults fall back to the server's configured
-   session interval.
-4. Updates the dialog's session interval, refresher role, and timestamp.
-5. Returns a 200 OK containing capability headers (`Allow`, `Supported`,
-   `Require`) and the negotiated `Session-Expires`.
-
-### UPDATE Lifecycle
-
-`handleUpdate` looks up the dialog (allowing for swapped tags when the server is
-not the refresher), validates the request, and merges new session timer values
-from `Session-Expires`. It responds with a 200 OK mirroring the INVITE
-capability headers while leaving dialog state consistent.
-
-### BYE Lifecycle
-
-`handleBye` removes dialogs. It attempts both tag orderings to support BYE
-requests initiated by either endpoint. If no dialog is found it returns 481
-(Call/Transaction Does Not Exist); otherwise it acknowledges with a 200 OK and
-cleans up the map entry.
-
-## Session Timer Management
-
-Session timers rely on helper functions:
-
-- `parseSessionExpires` parses the interval in seconds and optional
-  `refresher` parameter from the `Session-Expires` header.
-- `parseMinSE` reads the `Min-SE` header to enforce minimum timers.
-- `formatSessionExpires` renders negotiated values for responses.
-- `ensureTagPresent` injects a local `tag` parameter into the `To` header when
-  creating or updating dialogs.
-
-`ExpireSessions` allows external callers to purge dialogs whose `LastUpdated`
-plus `SessionInterval` is older than the supplied reference time. The method
-returns the removed `DialogState` records for further processing or logging.
-
-`dialogKey` builds a stable identifier by combining the Call-ID with sorted tag
-values so that lookups succeed regardless of caller ordering.
-
-## Transport Layer
-
-`ServeUDP` is a convenience loop that binds a UDP socket (defaulting to port
-5060), reads inbound datagrams, processes them through `Handle`, and writes the
-resulting wire-encoded responses back to the sender. Errors in request parsing
-silently drop the offending packet while the server continues servicing
-subsequent requests.
-
-This layering keeps networking concerns optional: embedders can provide their
-own transport by calling `HandleMessage` directly with parsed `Message` values.
-
+Malformed requests that lack a branch parameter or otherwise violate expectations
+are answered immediately with a 400 response generated inside the transaction
+layer. Unexpected responses are dropped. These choices keep the state machines
+robust while remaining faithful to the behaviour required by RFC 3261 for a
+stateful proxy.
