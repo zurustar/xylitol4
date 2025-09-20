@@ -89,3 +89,20 @@ are answered immediately with a 400 response generated inside the transaction
 layer. Unexpected responses are dropped. These choices keep the state machines
 robust while remaining faithful to the behaviour required by RFC 3261 for a
 stateful proxy.
+
+## Command Entrypoint
+
+The `cmd/sip-proxy` package wires the proxy to real UDP sockets so it can run as a
+standalone executable. A small supervisor in `main.go` is responsible for:
+
+- binding one socket for downstream clients and one for the upstream server;
+- decoding incoming datagrams with `sip.ParseMessage` and feeding them into the
+  proxy;
+- remembering the origin address for each downstream transaction via a TTL based
+  `transactionRouter` so that responses emerging from `Proxy.NextToClient` can be
+  written back to the right client; and
+- terminating goroutines cleanly when the process receives `SIGINT` or `SIGTERM`.
+
+The router extends the TTL on every successful lookup and a background cleanup
+loop prunes expired entries, ensuring memory usage remains bounded even for busy
+systems.
