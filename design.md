@@ -6,6 +6,27 @@ between the transport, transaction, and transaction user (TU) layers. Each
 layer owns its own goroutine and exchanges work exclusively through buffered
 queues so that they remain independently testable.
 
+## Source Layout
+
+The recent refactor split the proxy into one file per architectural layer to
+make the responsibilities easier to audit:
+
+- `proxy.go` – public façade that wires channels, starts goroutines, and exposes
+  the queue-based API to callers.
+- `transport.go` – pure transport logic that clones messages, normalises
+  `Content-Length`, and moves datagrams between the network-facing queues and
+  the transaction layer.
+- `transaction.go` – RFC 3261 server/client transaction state machines together
+  with helper utilities for managing branches, CSeq parsing, and generating
+  synthetic responses.
+- `transaction_user.go` – stateless proxy behaviour that mutates SIP headers,
+  allocates new branches, and chooses the correct direction when forwarding
+  messages.
+
+Each file only exports constructors and lifecycle helpers for its respective
+layer, which keeps the layering boundaries explicit and mirrors the structure
+outlined below.
+
 ## Layered Architecture
 
 The proxy is exposed through the `Proxy` type. Constructing a proxy wires three
