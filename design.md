@@ -16,9 +16,15 @@ make the responsibilities easier to audit:
 - `transport.go` – pure transport logic that clones messages, normalises
   `Content-Length`, and moves datagrams between the network-facing queues and
   the transaction layer.
-- `transaction.go` – RFC 3261 server/client transaction state machines together
-  with helper utilities for managing branches, CSeq parsing, and generating
-  synthetic responses.
+- `transaction.go` – transaction orchestrator that owns the registries,
+  dispatches transport/TU events, and instantiates typed transactions while
+  keeping the shared `transactionData` container.
+- `invite_server_transaction.go` / `non_invite_server_transaction.go` – INVITE
+  and non-INVITE server transaction state machines backed by `iota`-declared
+  enums that mirror RFC 3261 terminal states.
+- `invite_client_transaction.go` / `non_invite_client_transaction.go` –
+  corresponding client transaction state machines with their own enumerated
+  lifecycles and links to the originating server transaction.
 - `transaction_user.go` – stateless proxy behaviour that mutates SIP headers,
   allocates new branches, and chooses the correct direction when forwarding
   messages.
@@ -56,20 +62,19 @@ preserve ordering while preventing direct cross-layer calls.
 The transaction layer maintains two maps: one for server transactions keyed by
 branch parameters from downstream requests and another for client transactions
 keyed by the branch values the proxy generates for forwarded requests. Each
-transaction captures:
-
-- The original request or most recent response for retransmission purposes.
-- The RFC 3261 state (`Proceeding`, `Completed`, `Confirmed`, `Terminated` for
-  INVITE server transactions; `Calling`, `Proceeding`, `Completed`,
-  `Terminated` otherwise).
-- Directional information so that responses can be emitted toward the correct
-  transport queue.
+entry wraps a shared `transactionData` struct (containing the ID, branch,
+method, original request, and cached response) together with a state machine
+specific to INVITE or non-INVITE processing. The state machines live in their
+own files and use `iota` based enums to make transitions explicit while keeping
+the reusable data container free of SIP-specific behaviour.
 
 Server transactions emit a TU event the first time they observe a new request
 branch. Subsequent retransmissions are intercepted and satisfied using the last
-stored response without re-invoking upper layers. Client transactions tie an
-upstream branch to the originating server transaction so that responses from
-far-end servers can be routed back to the waiting downstream transaction.
+stored response without re-invoking upper layers. Client transactions keep the
+same shared data and additionally record the originating server transaction ID;
+this `serverTxID` is included with TU notifications so that responses received
+from far-end servers can be routed back to the waiting downstream transaction,
+even when multiple forks are active for the same dialog-less request.
 
 ## Proxy Core Behaviour
 
