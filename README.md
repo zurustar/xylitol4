@@ -8,7 +8,7 @@
 
 ```bash
 go build -o sip-proxy ./cmd/sip-proxy
-./sip-proxy --listen :5060 --upstream 192.0.2.10:5060
+./sip-proxy --listen :5060 --upstream 192.0.2.10:5060 --user-db ./users.db
 ```
 
 開発時にはバイナリを生成せずに `go run ./cmd/sip-proxy --upstream 192.0.2.10:5060` のように直接起動する
@@ -20,5 +20,6 @@ go build -o sip-proxy ./cmd/sip-proxy
 - `--upstream`: 上流の SIP サーバーに転送する UDP アドレス (必須)
 - `--upstream-bind`: 上流サーバーと通信する際に使用するローカル UDP アドレス (省略時は OS が割り当て)
 - `--route-ttl`: クライアントのトランザクションルートを保持する時間 (デフォルト 5 分)
+- `--user-db`: SIP ユーザ情報が格納された SQLite データベースファイルのパス (必須)
 
 プロセスは `SIGINT` または `SIGTERM` を受け取ると安全にシャットダウンします。
