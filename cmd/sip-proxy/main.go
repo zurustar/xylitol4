@@ -71,7 +71,8 @@ func main() {
 		logger.Fatalf("failed to resolve upstream address %s: %v", *upstreamAddr, err)
 	}
 
-	proxy := sip.NewProxy()
+	registrar := sip.NewRegistrar(userStore)
+	proxy := sip.NewProxy(sip.WithRegistrar(registrar))
 	routes := newTransactionRouter(*routeTTL)
 
 	logger.Printf("listening on %s, upstream %s (local upstream %s)", downstreamConn.LocalAddr(), upstreamUDPAddr, upstreamConn.LocalAddr())
