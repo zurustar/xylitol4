@@ -13,6 +13,9 @@ make the responsibilities easier to audit:
 
 - `proxy.go` – public façade that wires channels, starts goroutines, and exposes
   the queue-based API to callers.
+- `stack.go` – process integration layer that loads the user directory, opens
+  network sockets, and supervises the long-running goroutines behind the
+  `SIPStack` type used by the executable.
 - `transport.go` – pure transport logic that clones messages, normalises
   `Content-Length`, and moves datagrams between the network-facing queues and
   the transaction layer.
@@ -174,16 +177,16 @@ server, `--upstream-bind` pins the local address for upstream traffic, and
 `--route-ttl` controls how long transaction routes are cached. A `--user-db`
 argument is also required so the process can open the SQLite-backed directory,
 eagerly load all entries for logging, and construct the registrar used for
-REGISTER handling. A small supervisor in `main.go` is responsible for:
+REGISTER handling. These responsibilities now live inside the `SIPStack` type in
+`sip/stack.go`, which opens the sockets, loads the user directory, instantiates the
+registrar-backed proxy, and supervises the worker goroutines that bridge the network
+with the queue-based proxy API. The stack also owns the TTL-based `transactionRouter`
+used to remember downstream routes and runs the periodic cleanup loop that prunes
+expired entries.
 
-- binding one socket for downstream clients and one for the upstream server;
-- decoding incoming datagrams with `sip.ParseMessage` and feeding them into the
-  proxy;
-- remembering the origin address for each downstream transaction via a TTL based
-  `transactionRouter` so that responses emerging from `Proxy.NextToClient` can be
-  written back to the right client; and
-- terminating goroutines cleanly when the process receives `SIGINT` or `SIGTERM`.
-
-The router extends the TTL on every successful lookup and a background cleanup
-loop prunes expired entries, ensuring memory usage remains bounded even for busy
-systems.
+`main.go` is reduced to flag parsing, signal handling, and lifecycle control. It
+constructs a `SIPStack`, calls `Start` with the signal-aware context, waits for that
+context to be cancelled, and then invokes `Stop` to shut down the proxy cleanly. By
+keeping signal handling in `main` but centralising the rest of the runtime wiring in
+the stack, the command remains small while the collaborating components stay tightly
+coordinated.

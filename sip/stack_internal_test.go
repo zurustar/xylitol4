@@ -1,15 +1,13 @@
-package main
+package sip
 
 import (
 	"net"
 	"testing"
 	"time"
-
-	"xylitol4/sip"
 )
 
 func TestTransactionKeyFromRequest(t *testing.T) {
-	msg := sip.NewRequest("INVITE", "sip:bob@example.com")
+	msg := NewRequest("INVITE", "sip:bob@example.com")
 	msg.SetHeader("Via", "SIP/2.0/UDP client.example.com;branch=z9hG4bKclient1")
 
 	key := transactionKeyFromRequest(msg)
@@ -19,7 +17,7 @@ func TestTransactionKeyFromRequest(t *testing.T) {
 }
 
 func TestTransactionKeyFromResponse(t *testing.T) {
-	resp := sip.NewResponse(200, "OK")
+	resp := NewResponse(200, "OK")
 	resp.SetHeader("Via", "SIP/2.0/UDP client.example.com;branch=z9hG4bKclient1")
 	resp.SetHeader("CSeq", "42 INVITE")
 
