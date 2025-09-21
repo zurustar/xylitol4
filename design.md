@@ -28,6 +28,12 @@ make the responsibilities easier to audit:
 - `transaction_user.go` – stateless proxy behaviour that mutates SIP headers,
   allocates new branches, and chooses the correct direction when forwarding
   messages.
+- `message.go` – core SIP message representation, parser, and renderer shared by
+  every layer and the command-line entrypoint.
+- `registrar.go` – built-in registrar that authenticates REGISTER requests and
+  stores contact bindings for downstream lookups.
+- `userdb/` – SQLite-backed user directory helpers plus the in-memory driver
+  used by tests to exercise the same queries without CGO.
 
 Each file only exports constructors and lifecycle helpers for its respective
 layer, which keeps the layering boundaries explicit and mirrors the structure
@@ -162,7 +168,13 @@ traffic is validated and recorded without involving the upstream server.
 ## Command Entrypoint
 
 The `cmd/sip-proxy` package wires the proxy to real UDP sockets so it can run as a
-standalone executable. A small supervisor in `main.go` is responsible for:
+standalone executable. Runtime behaviour is configured through command-line flags:
+`--listen` selects the downstream bind address, `--upstream` chooses the target
+server, `--upstream-bind` pins the local address for upstream traffic, and
+`--route-ttl` controls how long transaction routes are cached. A `--user-db`
+argument is also required so the process can open the SQLite-backed directory,
+eagerly load all entries for logging, and construct the registrar used for
+REGISTER handling. A small supervisor in `main.go` is responsible for:
 
 - binding one socket for downstream clients and one for the upstream server;
 - decoding incoming datagrams with `sip.ParseMessage` and feeding them into the
