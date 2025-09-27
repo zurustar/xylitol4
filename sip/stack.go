@@ -43,6 +43,9 @@ type SIPStack struct {
 	upstreamConn   net.PacketConn
 	upstreamAddr   net.Addr
 
+	managedDomains map[string]struct{}
+	directory      map[string]userdb.User
+
 	routes *transactionRouter
 
 	runCtx context.Context
@@ -59,9 +62,6 @@ func NewSIPStack(cfg SIPStackConfig) (*SIPStack, error) {
 	}
 
 	cfg.UpstreamAddr = strings.TrimSpace(cfg.UpstreamAddr)
-	if cfg.UpstreamAddr == "" {
-		return nil, fmt.Errorf("sip: upstream address is required")
-	}
 
 	cfg.UpstreamBind = strings.TrimSpace(cfg.UpstreamBind)
 
@@ -117,6 +117,17 @@ func (s *SIPStack) Start(ctx context.Context) error {
 	}
 	s.logger.Printf("loaded %d user directory entries from %s", len(users), s.cfg.UserDBPath)
 
+	s.managedDomains = make(map[string]struct{})
+	s.directory = make(map[string]userdb.User, len(users))
+	for _, user := range users {
+		key := registrarKey(user.Username, user.Domain)
+		s.directory[key] = user
+		domain := strings.ToLower(strings.TrimSpace(user.Domain))
+		if domain != "" {
+			s.managedDomains[domain] = struct{}{}
+		}
+	}
+
 	downstreamConn, err := net.ListenPacket("udp", s.cfg.ListenAddr)
 	if err != nil {
 		s.cleanupOnError()
@@ -131,12 +142,14 @@ func (s *SIPStack) Start(ctx context.Context) error {
 	}
 	s.upstreamConn = upstreamConn
 
-	upstreamAddr, err := net.ResolveUDPAddr("udp", s.cfg.UpstreamAddr)
-	if err != nil {
-		s.cleanupOnError()
-		return fmt.Errorf("sip: resolve upstream address %s: %w", s.cfg.UpstreamAddr, err)
+	if s.cfg.UpstreamAddr != "" {
+		upstreamAddr, err := net.ResolveUDPAddr("udp", s.cfg.UpstreamAddr)
+		if err != nil {
+			s.cleanupOnError()
+			return fmt.Errorf("sip: resolve upstream address %s: %w", s.cfg.UpstreamAddr, err)
+		}
+		s.upstreamAddr = upstreamAddr
 	}
-	s.upstreamAddr = upstreamAddr
 
 	registrar := NewRegistrar(store)
 	s.registrar = registrar
@@ -152,7 +165,11 @@ func (s *SIPStack) Start(ctx context.Context) error {
 	go s.runDownstreamSender()
 	go s.runRouteCleanup()
 
-	s.logger.Printf("listening on %s, upstream %s (local upstream %s)", s.downstreamConn.LocalAddr(), s.upstreamAddr, s.upstreamConn.LocalAddr())
+	upstreamLabel := "(dynamic)"
+	if s.upstreamAddr != nil {
+		upstreamLabel = s.upstreamAddr.String()
+	}
+	s.logger.Printf("listening on %s, upstream %s (local upstream %s)", s.downstreamConn.LocalAddr(), upstreamLabel, s.upstreamConn.LocalAddr())
 
 	s.mu.Lock()
 	s.started = true
@@ -205,6 +222,8 @@ func (s *SIPStack) Stop() {
 	s.downstreamConn = nil
 	s.upstreamConn = nil
 	s.upstreamAddr = nil
+	s.managedDomains = nil
+	s.directory = nil
 	s.routes = nil
 	s.registrar = nil
 	s.runCtx = nil
@@ -233,6 +252,8 @@ func (s *SIPStack) cleanupOnError() {
 	s.downstreamConn = nil
 	s.upstreamConn = nil
 	s.upstreamAddr = nil
+	s.managedDomains = nil
+	s.directory = nil
 	s.routes = nil
 	s.registrar = nil
 	s.runCtx = nil
@@ -313,7 +334,7 @@ func (s *SIPStack) runUpstreamReader() {
 func (s *SIPStack) runUpstreamSender() {
 	defer s.wg.Done()
 
-	if s.proxy == nil || s.upstreamConn == nil || s.upstreamAddr == nil {
+	if s.proxy == nil || s.upstreamConn == nil {
 		return
 	}
 
@@ -325,12 +346,21 @@ func (s *SIPStack) runUpstreamSender() {
 			}
 			continue
 		}
+		addr, err := s.selectUpstreamTarget(msg)
+		if err != nil {
+			s.logger.Printf("failed to resolve upstream target for %s: %v", summarizeMessage(msg), err)
+			continue
+		}
+		if addr == nil {
+			s.logger.Printf("no upstream target for %s; dropping message", summarizeMessage(msg))
+			continue
+		}
 		payload := []byte(msg.String())
-		if _, err := s.upstreamConn.WriteTo(payload, s.upstreamAddr); err != nil {
+		if _, err := s.upstreamConn.WriteTo(payload, addr); err != nil {
 			if (s.runCtx != nil && s.runCtx.Err() != nil) || errors.Is(err, net.ErrClosed) {
 				return
 			}
-			s.logger.Printf("failed to send upstream message: %v", err)
+			s.logger.Printf("failed to send upstream message to %s: %v", addr.String(), err)
 		}
 	}
 }
@@ -377,6 +407,180 @@ func (s *SIPStack) runRouteCleanup() {
 		return
 	}
 	s.routes.RunCleanup(s.runCtx, time.Minute)
+}
+
+func (s *SIPStack) selectUpstreamTarget(msg *Message) (*net.UDPAddr, error) {
+	if msg == nil {
+		return nil, fmt.Errorf("sip: nil message")
+	}
+	if !msg.IsRequest() {
+		return s.cloneDefaultUpstream()
+	}
+
+	user, host, port, err := parseSIPURI(msg.RequestURI)
+	if err != nil {
+		return s.cloneDefaultUpstream()
+	}
+	lowerHost := strings.ToLower(host)
+	if _, ok := s.managedDomains[lowerHost]; ok {
+		if target := s.resolveRegistrarTarget(user, lowerHost); target != nil {
+			return target, nil
+		}
+		if target := s.resolveDirectoryTarget(user, lowerHost); target != nil {
+			return target, nil
+		}
+	}
+
+	if host != "" {
+		addr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(host, port))
+		if err == nil {
+			return addr, nil
+		}
+	}
+
+	return s.cloneDefaultUpstream()
+}
+
+func (s *SIPStack) resolveRegistrarTarget(user, domain string) *net.UDPAddr {
+	if s.registrar == nil || user == "" || domain == "" {
+		return nil
+	}
+	bindings := s.registrar.BindingsFor(user, domain)
+	for _, binding := range bindings {
+		contact := contactAddress(binding.Contact)
+		if contact == "" {
+			contact = binding.Contact
+		}
+		if addr, err := sipURIToUDPAddr(contact); err == nil {
+			return addr
+		}
+	}
+	return nil
+}
+
+func (s *SIPStack) resolveDirectoryTarget(user, domain string) *net.UDPAddr {
+	if user == "" || domain == "" {
+		return nil
+	}
+	if s.directory == nil {
+		return nil
+	}
+	key := registrarKey(user, domain)
+	entry, ok := s.directory[key]
+	if !ok {
+		return nil
+	}
+	if entry.ContactURI == "" {
+		return nil
+	}
+	addr, err := sipURIToUDPAddr(entry.ContactURI)
+	if err != nil {
+		return nil
+	}
+	return addr
+}
+
+func (s *SIPStack) cloneDefaultUpstream() (*net.UDPAddr, error) {
+	if s.upstreamAddr == nil {
+		return nil, fmt.Errorf("sip: no upstream address configured")
+	}
+	if udp, ok := s.upstreamAddr.(*net.UDPAddr); ok {
+		clone := *udp
+		return &clone, nil
+	}
+	addr, err := net.ResolveUDPAddr("udp", s.upstreamAddr.String())
+	if err != nil {
+		return nil, err
+	}
+	return addr, nil
+}
+
+func sipURIToUDPAddr(uri string) (*net.UDPAddr, error) {
+	_, host, port, err := parseSIPURI(uri)
+	if err != nil {
+		return nil, err
+	}
+	if host == "" {
+		return nil, fmt.Errorf("sip: uri missing host")
+	}
+	return net.ResolveUDPAddr("udp", net.JoinHostPort(host, port))
+}
+
+func parseSIPURI(uri string) (user, host, port string, err error) {
+	uri = strings.TrimSpace(uri)
+	if uri == "" {
+		return "", "", "", fmt.Errorf("sip: empty uri")
+	}
+
+	if idx := strings.Index(uri, "<"); idx != -1 {
+		if end := strings.Index(uri[idx:], ">"); end != -1 {
+			uri = uri[idx+1 : idx+end]
+		}
+	}
+	if idx := strings.Index(uri, ">"); idx != -1 {
+		uri = uri[:idx]
+	}
+
+	lower := strings.ToLower(uri)
+	switch {
+	case strings.HasPrefix(lower, "sip:"):
+		uri = uri[4:]
+	case strings.HasPrefix(lower, "sips:"):
+		uri = uri[5:]
+	}
+
+	if idx := strings.Index(uri, "?"); idx != -1 {
+		uri = uri[:idx]
+	}
+	if idx := strings.Index(uri, ";"); idx != -1 {
+		uri = uri[:idx]
+	}
+
+	uri = strings.TrimSpace(uri)
+	if uri == "" {
+		return "", "", "", fmt.Errorf("sip: empty uri host")
+	}
+
+	hostPort := uri
+	if at := strings.LastIndex(uri, "@"); at != -1 {
+		user = strings.TrimSpace(uri[:at])
+		hostPort = uri[at+1:]
+	}
+
+	hostPort = strings.TrimSpace(hostPort)
+	if hostPort == "" {
+		return user, "", "", fmt.Errorf("sip: missing host")
+	}
+
+	if strings.HasPrefix(hostPort, "[") {
+		end := strings.Index(hostPort, "]")
+		if end == -1 {
+			return "", "", "", fmt.Errorf("sip: invalid ipv6 literal")
+		}
+		host = strings.TrimSpace(hostPort[1:end])
+		rest := strings.TrimSpace(hostPort[end+1:])
+		if strings.HasPrefix(rest, ":") {
+			port = strings.TrimSpace(rest[1:])
+		}
+	} else {
+		colon := strings.LastIndex(hostPort, ":")
+		if colon != -1 && !strings.Contains(hostPort[colon+1:], ":") {
+			port = strings.TrimSpace(hostPort[colon+1:])
+			host = strings.TrimSpace(hostPort[:colon])
+		} else {
+			host = hostPort
+		}
+	}
+
+	host = strings.Trim(host, "[]")
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return user, "", "", fmt.Errorf("sip: missing host")
+	}
+	if port == "" {
+		port = "5060"
+	}
+	return strings.TrimSpace(user), host, port, nil
 }
 
 func summarizeMessage(msg *Message) string {

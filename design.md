@@ -102,6 +102,29 @@ The TU layer acts as a simple, always-forwarding proxy:
 This small amount of SIP intelligence is confined to the TU, leaving both the
 transport and transaction layers unaware of proxy-specific policy.
 
+## Upstream Routing
+
+To operate as an upstream server the stack now derives the next hop for every
+forwarded request dynamically. At startup `SIPStack` records the set of domains
+present in the user directory together with any statically configured contact
+URIs. When a request is ready to be forwarded, the stack resolves the target in
+the following order:
+
+1. **Registrar bindings** – If the Request-URI domain is managed locally and the
+   registrar has an active binding for the target user, the associated contact
+   URI is parsed and used as the transport destination.
+2. **Directory defaults** – When no live registration exists, any `ContactURI`
+   stored in the directory entry serves as the fallback address for that user.
+3. **Request-URI host** – Otherwise the host/port portion of the Request-URI is
+   resolved directly (including literal IP addresses).
+4. **Configured default upstream** – If all of the above fail and a default
+   `--upstream` address was supplied, the message is sent there for final
+   resolution.
+
+This strategy allows the binary to run without a mandatory upstream hop while
+remaining compatible with the previous configuration style that specified a
+single forwarding address.
+
 ## Public Surface
 
 Tests interact with the proxy via four queues exposed on `Proxy`:
