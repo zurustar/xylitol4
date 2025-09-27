@@ -213,3 +213,11 @@ context to be cancelled, and then invokes `Stop` to shut down the proxy cleanly.
 keeping signal handling in `main` but centralising the rest of the runtime wiring in
 the stack, the command remains small while the collaborating components stay tightly
 coordinated.
+
+## Web管理インタフェース
+
+SQLiteベースのユーザディレクトリを直接操作できるWeb UIを`cmd/user-web`コマンドとして追加した。HTTP Basic認証で保護された`/admin/users`
+エンドポイントではユーザ一覧の表示、初期パスワードやContact URIを指定したユーザ登録、既存ユーザの削除をフォームで提供する。これらの操
+作は`sip/userdb.SQLiteStore`に追加した`CreateUser`/`DeleteUser`/`UpdatePassword`メソッド経由で実行される。利用者向けの`/password`エン
+ドポイントでは現在のパスワードを検証したうえで`HashPassword`/`VerifyPassword`ヘルパーを用いて新しいパスワードをHA1ダイジェストとして保
+存する。テンプレートは`html/template`で組み込み、一覧はドメイン・ユーザ名順にソートして表示する。

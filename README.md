@@ -23,3 +23,16 @@ go build -o sip-proxy ./cmd/sip-proxy
 - `--user-db`: SIP ユーザ情報が格納された SQLite データベースファイルのパス (必須)
 
 プロセスは `SIGINT` または `SIGTERM` を受け取ると安全にシャットダウンします。
+
+## ユーザ管理Webインタフェース
+
+ユーザアカウントの登録やパスワード変更を行うには、`cmd/user-web`に含まれるHTTPサーバを起動する。
+
+```bash
+go run ./cmd/user-web --listen :8080 --user-db ./users.db --admin-user admin --admin-pass changeme
+```
+
+- `/admin/users` … 管理者向け画面。Basic認証で保護されており、ユーザ一覧の表示、新規登録、削除が行える。
+- `/password` … 利用者向け画面。現在のパスワードで認証したうえで新しいパスワードを設定できる。
+
+Web UIでの操作はSIPプロキシと同じSQLiteデータベースを利用するため、同じ資格情報でREGISTER認証を行える。
