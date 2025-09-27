@@ -65,10 +65,35 @@ func (c *memoryConn) exec(query string, args []driver.NamedValue) (driver.Result
 		}
 		return memoryResult{}, nil
 	case insertStmt:
+		bound, err := bindInsertValues(s.values, args)
+		if err != nil {
+			return nil, err
+		}
+		s.values = bound
 		if err := c.db.insertRow(s); err != nil {
 			return nil, err
 		}
 		return memoryResult{rowsAffected: int64(len(s.values))}, nil
+	case updateStmt:
+		setValues, whereValues, err := bindUpdateArgs(s, args)
+		if err != nil {
+			return nil, err
+		}
+		affected, err := c.db.updateRows(s, setValues, whereValues)
+		if err != nil {
+			return nil, err
+		}
+		return memoryResult{rowsAffected: affected}, nil
+	case deleteStmt:
+		whereValues, err := bindDeleteArgs(s, args)
+		if err != nil {
+			return nil, err
+		}
+		affected, err := c.db.deleteRows(s, whereValues)
+		if err != nil {
+			return nil, err
+		}
+		return memoryResult{rowsAffected: affected}, nil
 	case selectStmt:
 		// SELECT executed via Exec is not supported
 		return nil, fmt.Errorf("select statements require Query")
@@ -203,6 +228,61 @@ func (db *memoryDatabase) insertRow(stmt insertStmt) error {
 	return nil
 }
 
+func (db *memoryDatabase) updateRows(stmt updateStmt, setValues, whereValues []string) (int64, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	table, ok := db.tables[stmt.table]
+	if !ok {
+		return 0, fmt.Errorf("table %s does not exist", stmt.table)
+	}
+	if len(stmt.setColumns) != len(setValues) {
+		return 0, fmt.Errorf("update column/value mismatch")
+	}
+	where := make(map[string]string, len(stmt.whereColumns))
+	for i, col := range stmt.whereColumns {
+		if i < len(whereValues) {
+			where[col] = whereValues[i]
+		}
+	}
+	var affected int64
+	for _, row := range table.rows {
+		if !rowMatches(row, where) {
+			continue
+		}
+		for i, col := range stmt.setColumns {
+			row[col] = setValues[i]
+		}
+		affected++
+	}
+	return affected, nil
+}
+
+func (db *memoryDatabase) deleteRows(stmt deleteStmt, whereValues []string) (int64, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	table, ok := db.tables[stmt.table]
+	if !ok {
+		return 0, fmt.Errorf("table %s does not exist", stmt.table)
+	}
+	where := make(map[string]string, len(stmt.whereColumns))
+	for i, col := range stmt.whereColumns {
+		if i < len(whereValues) {
+			where[col] = whereValues[i]
+		}
+	}
+	var affected int64
+	kept := make([]map[string]string, 0, len(table.rows))
+	for _, row := range table.rows {
+		if rowMatches(row, where) {
+			affected++
+			continue
+		}
+		kept = append(kept, row)
+	}
+	table.rows = kept
+	return affected, nil
+}
+
 func (db *memoryDatabase) selectRows(stmt selectStmt, args []string) [][]string {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
@@ -257,6 +337,18 @@ type insertStmt struct {
 	values  [][]string
 }
 
+type updateStmt struct {
+	table        string
+	setColumns   []string
+	setValues    []string
+	whereColumns []string
+}
+
+type deleteStmt struct {
+	table        string
+	whereColumns []string
+}
+
 type selectStmt struct {
 	columns      []string
 	table        string
@@ -277,6 +369,12 @@ func parseSQL(query string) (interface{}, error) {
 	}
 	if strings.HasPrefix(strings.ToUpper(trimmed), "INSERT INTO") {
 		return parseInsert(trimmed)
+	}
+	if strings.HasPrefix(strings.ToUpper(trimmed), "UPDATE") {
+		return parseUpdate(trimmed)
+	}
+	if strings.HasPrefix(strings.ToUpper(trimmed), "DELETE FROM") {
+		return parseDelete(trimmed)
 	}
 	if strings.HasPrefix(strings.ToUpper(trimmed), "SELECT") {
 		return parseSelect(trimmed)
@@ -338,6 +436,129 @@ func parseInsert(query string) (insertStmt, error) {
 		values = append(values, row)
 	}
 	return insertStmt{table: table, columns: columns, values: values}, nil
+}
+
+func parseUpdate(query string) (updateStmt, error) {
+	upper := strings.ToUpper(query)
+	if !strings.HasPrefix(upper, "UPDATE ") {
+		return updateStmt{}, fmt.Errorf("invalid UPDATE syntax")
+	}
+	remainder := strings.TrimSpace(query[len("UPDATE "):])
+	setIdx := strings.Index(strings.ToUpper(remainder), " SET ")
+	if setIdx == -1 {
+		return updateStmt{}, fmt.Errorf("missing SET clause")
+	}
+	table := strings.TrimSpace(remainder[:setIdx])
+	remainder = strings.TrimSpace(remainder[setIdx+len(" SET "):])
+	whereIdx := strings.Index(strings.ToUpper(remainder), " WHERE ")
+	assignments := remainder
+	whereClause := ""
+	if whereIdx != -1 {
+		assignments = strings.TrimSpace(remainder[:whereIdx])
+		whereClause = strings.TrimSpace(remainder[whereIdx+len(" WHERE "):])
+	}
+	parts := splitComma(assignments)
+	setColumns := make([]string, 0, len(parts))
+	setValues := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		pieces := strings.SplitN(part, "=", 2)
+		if len(pieces) != 2 {
+			continue
+		}
+		setColumns = append(setColumns, strings.TrimSpace(pieces[0]))
+		setValues = append(setValues, strings.TrimSpace(pieces[1]))
+	}
+	if len(setColumns) == 0 {
+		return updateStmt{}, fmt.Errorf("no columns to update")
+	}
+	whereColumns := []string{}
+	if whereClause != "" {
+		whereColumns = parseWhere(whereClause)
+	}
+	return updateStmt{table: table, setColumns: setColumns, setValues: setValues, whereColumns: whereColumns}, nil
+}
+
+func parseDelete(query string) (deleteStmt, error) {
+	upper := strings.ToUpper(query)
+	if !strings.HasPrefix(upper, "DELETE FROM ") {
+		return deleteStmt{}, fmt.Errorf("invalid DELETE syntax")
+	}
+	remainder := strings.TrimSpace(query[len("DELETE FROM "):])
+	table := remainder
+	whereColumns := []string{}
+	if idx := strings.Index(strings.ToUpper(remainder), " WHERE "); idx != -1 {
+		table = strings.TrimSpace(remainder[:idx])
+		clause := strings.TrimSpace(remainder[idx+len(" WHERE "):])
+		whereColumns = parseWhere(clause)
+	}
+	return deleteStmt{table: table, whereColumns: whereColumns}, nil
+}
+
+func bindInsertValues(values [][]string, args []driver.NamedValue) ([][]string, error) {
+	bound := make([][]string, len(values))
+	argIdx := 0
+	for i, tuple := range values {
+		row := make([]string, len(tuple))
+		for j, val := range tuple {
+			if val == "?" {
+				if argIdx >= len(args) {
+					return nil, fmt.Errorf("missing argument for INSERT placeholder")
+				}
+				row[j] = fmt.Sprint(args[argIdx].Value)
+				argIdx++
+			} else {
+				row[j] = val
+			}
+		}
+		bound[i] = row
+	}
+	if argIdx != len(args) {
+		return nil, fmt.Errorf("unexpected argument count for INSERT")
+	}
+	return bound, nil
+}
+
+func bindUpdateArgs(stmt updateStmt, args []driver.NamedValue) ([]string, []string, error) {
+	setValues := make([]string, len(stmt.setValues))
+	argIdx := 0
+	for i, raw := range stmt.setValues {
+		if raw == "?" {
+			if argIdx >= len(args) {
+				return nil, nil, fmt.Errorf("missing argument for UPDATE placeholder")
+			}
+			setValues[i] = fmt.Sprint(args[argIdx].Value)
+			argIdx++
+		} else {
+			setValues[i] = unquote(raw)
+		}
+	}
+	whereValues := make([]string, len(stmt.whereColumns))
+	for i := range whereValues {
+		if argIdx >= len(args) {
+			return nil, nil, fmt.Errorf("missing argument for UPDATE WHERE placeholder")
+		}
+		whereValues[i] = fmt.Sprint(args[argIdx].Value)
+		argIdx++
+	}
+	if argIdx != len(args) {
+		return nil, nil, fmt.Errorf("unexpected argument count for UPDATE")
+	}
+	return setValues, whereValues, nil
+}
+
+func bindDeleteArgs(stmt deleteStmt, args []driver.NamedValue) ([]string, error) {
+	whereValues := make([]string, len(stmt.whereColumns))
+	if len(args) != len(stmt.whereColumns) {
+		return nil, fmt.Errorf("unexpected argument count for DELETE")
+	}
+	for i := range whereValues {
+		whereValues[i] = fmt.Sprint(args[i].Value)
+	}
+	return whereValues, nil
 }
 
 func parseSelect(query string) (selectStmt, error) {
@@ -495,4 +716,16 @@ func unquote(value string) string {
 	value = strings.ReplaceAll(value, "''", "'")
 	value = strings.ReplaceAll(value, "\"\"", "\"")
 	return value
+}
+
+func rowMatches(row map[string]string, conditions map[string]string) bool {
+	if len(conditions) == 0 {
+		return true
+	}
+	for col, expected := range conditions {
+		if row[col] != expected {
+			return false
+		}
+	}
+	return true
 }

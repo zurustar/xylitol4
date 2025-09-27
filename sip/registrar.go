@@ -375,7 +375,7 @@ func verifyDigest(params map[string]string, req *Message, user *userdb.User, rea
 	if uri == "" {
 		uri = req.RequestURI
 	}
-	ha1 := computeHA1(user.Username, realm, user.PasswordHash)
+	ha1 := userdb.ComputeHA1(user.Username, realm, user.PasswordHash)
 	if ha1 == "" {
 		return fmt.Errorf("missing credentials")
 	}
@@ -399,18 +399,6 @@ func verifyDigest(params map[string]string, req *Message, user *userdb.User, rea
 		return fmt.Errorf("digest mismatch")
 	}
 	return nil
-}
-
-func computeHA1(username, realm, stored string) string {
-	stored = strings.TrimSpace(stored)
-	if stored == "" {
-		return ""
-	}
-	if len(stored) == 32 && isHex(stored) {
-		return strings.ToLower(stored)
-	}
-	raw := fmt.Sprintf("%s:%s:%s", username, realm, stored)
-	return md5Hex(raw)
 }
 
 func md5Hex(input string) string {

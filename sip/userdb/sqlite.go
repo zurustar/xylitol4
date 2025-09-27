@@ -123,6 +123,64 @@ func (s *SQLiteStore) AllUsers(ctx context.Context) ([]User, error) {
 	return users, nil
 }
 
+// CreateUser inserts a new user entry into the database.
+func (s *SQLiteStore) CreateUser(ctx context.Context, user User) error {
+	if s == nil || s.db == nil {
+		return fmt.Errorf("userdb: store is not initialised")
+	}
+	if strings.TrimSpace(user.Username) == "" {
+		return fmt.Errorf("userdb: username is required")
+	}
+	if strings.TrimSpace(user.Domain) == "" {
+		return fmt.Errorf("userdb: domain is required")
+	}
+	const query = `INSERT INTO users (username, domain, password_hash, contact_uri) VALUES (?, ?, ?, ?)`
+	if _, err := s.db.ExecContext(ctx, query, user.Username, user.Domain, user.PasswordHash, user.ContactURI); err != nil {
+		return fmt.Errorf("userdb: create user: %w", err)
+	}
+	return nil
+}
+
+// DeleteUser removes a user entry from the database.
+func (s *SQLiteStore) DeleteUser(ctx context.Context, username, domain string) error {
+	if s == nil || s.db == nil {
+		return fmt.Errorf("userdb: store is not initialised")
+	}
+	const query = `DELETE FROM users WHERE username = ? AND domain = ?`
+	res, err := s.db.ExecContext(ctx, query, username, domain)
+	if err != nil {
+		return fmt.Errorf("userdb: delete user: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("userdb: delete user rows affected: %w", err)
+	}
+	if affected == 0 {
+		return ErrUserNotFound
+	}
+	return nil
+}
+
+// UpdatePassword updates the stored password hash for a user.
+func (s *SQLiteStore) UpdatePassword(ctx context.Context, username, domain, passwordHash string) error {
+	if s == nil || s.db == nil {
+		return fmt.Errorf("userdb: store is not initialised")
+	}
+	const query = `UPDATE users SET password_hash = ? WHERE username = ? AND domain = ?`
+	res, err := s.db.ExecContext(ctx, query, passwordHash, username, domain)
+	if err != nil {
+		return fmt.Errorf("userdb: update password: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("userdb: update password rows affected: %w", err)
+	}
+	if affected == 0 {
+		return ErrUserNotFound
+	}
+	return nil
+}
+
 // UnderlyingDB exposes the raw database handle. It is primarily intended for
 // testing purposes where schema initialisation is required.
 func (s *SQLiteStore) UnderlyingDB() *sql.DB {
