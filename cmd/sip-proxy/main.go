@@ -20,13 +20,13 @@ func main() {
 	userDBPath := flag.String("user-db", "", "Path to SQLite database containing SIP user directory")
 	flag.Parse()
 
-	if *upstreamAddr == "" {
-		flag.Usage()
-		log.Fatal("the --upstream flag is required")
-	}
 	if *userDBPath == "" {
 		flag.Usage()
 		log.Fatal("the --user-db flag is required")
+	}
+
+	if *upstreamAddr == "" {
+		log.Println("--upstream not provided; requests will be routed using local registrations or Request-URI resolution")
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
