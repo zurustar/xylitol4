@@ -23,6 +23,7 @@ type Proxy struct {
 
 type proxyConfig struct {
 	registrar *Registrar
+	broadcast *BroadcastPolicy
 }
 
 // ProxyOption customises the behaviour of a Proxy during construction.
@@ -33,6 +34,13 @@ type ProxyOption func(*proxyConfig)
 func WithRegistrar(registrar *Registrar) ProxyOption {
 	return func(cfg *proxyConfig) {
 		cfg.registrar = registrar
+	}
+}
+
+// WithBroadcastPolicy configures the proxy with a broadcast ringing policy.
+func WithBroadcastPolicy(policy *BroadcastPolicy) ProxyOption {
+	return func(cfg *proxyConfig) {
+		cfg.broadcast = policy
 	}
 }
 
@@ -69,7 +77,7 @@ func NewProxy(opts ...ProxyOption) *Proxy {
 
 	proxy.transport = newTransportLayer(clientIn, serverIn, clientOut, serverOut, transportToTxn, txnToTransport)
 	proxy.transactions = newTransactionLayer(transportToTxn, txnToTransport, txnToTU, tuToTxn)
-	proxy.core = newTransactionUser(txnToTU, tuToTxn, cfg.registrar)
+	proxy.core = newTransactionUser(txnToTU, tuToTxn, cfg.registrar, cfg.broadcast)
 
 	proxy.transport.start(ctx)
 	proxy.transactions.start(ctx)

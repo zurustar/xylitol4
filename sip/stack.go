@@ -38,6 +38,7 @@ type SIPStack struct {
 	userStore *userdb.SQLiteStore
 	registrar *Registrar
 	proxy     *Proxy
+	broadcast *BroadcastPolicy
 
 	downstreamConn net.PacketConn
 	upstreamConn   net.PacketConn
@@ -128,6 +129,17 @@ func (s *SIPStack) Start(ctx context.Context) error {
 		}
 	}
 
+	ruleCtx, cancelRules := context.WithTimeout(ctx, s.cfg.UserLoadTimeout)
+	rules, err := store.ListBroadcastRules(ruleCtx)
+	cancelRules()
+	if err != nil {
+		s.cleanupOnError()
+		return fmt.Errorf("sip: load broadcast rules from %s: %w", s.cfg.UserDBPath, err)
+	}
+	policy := convertBroadcastRules(rules)
+	s.broadcast = policy
+	s.logger.Printf("loaded %d broadcast ringing rules", len(rules))
+
 	downstreamConn, err := net.ListenPacket("udp", s.cfg.ListenAddr)
 	if err != nil {
 		s.cleanupOnError()
@@ -153,7 +165,11 @@ func (s *SIPStack) Start(ctx context.Context) error {
 
 	registrar := NewRegistrar(store)
 	s.registrar = registrar
-	s.proxy = NewProxy(WithRegistrar(registrar))
+	opts := []ProxyOption{WithRegistrar(registrar)}
+	if policy != nil {
+		opts = append(opts, WithBroadcastPolicy(policy))
+	}
+	s.proxy = NewProxy(opts...)
 	s.routes = newTransactionRouter(s.cfg.RouteTTL)
 
 	s.runCtx, s.cancel = context.WithCancel(context.Background())
@@ -581,6 +597,28 @@ func parseSIPURI(uri string) (user, host, port string, err error) {
 		port = "5060"
 	}
 	return strings.TrimSpace(user), host, port, nil
+}
+
+func convertBroadcastRules(rules []userdb.BroadcastRule) *BroadcastPolicy {
+	if len(rules) == 0 {
+		return nil
+	}
+	converted := make([]BroadcastRule, 0, len(rules))
+	for _, rule := range rules {
+		targets := make([]string, 0, len(rule.Targets))
+		for _, target := range rule.Targets {
+			contact := strings.TrimSpace(target.ContactURI)
+			if contact == "" {
+				continue
+			}
+			targets = append(targets, contact)
+		}
+		converted = append(converted, BroadcastRule{Address: rule.Address, Targets: targets})
+	}
+	if len(converted) == 0 {
+		return nil
+	}
+	return NewBroadcastPolicy(converted)
 }
 
 func summarizeMessage(msg *Message) string {
