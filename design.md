@@ -79,11 +79,42 @@ the reusable data container free of SIP-specific behaviour.
 
 Server transactions emit a TU event the first time they observe a new request
 branch. Subsequent retransmissions are intercepted and satisfied using the last
-stored response without re-invoking upper layers. Client transactions keep the
-same shared data and additionally record the originating server transaction ID;
-this `serverTxID` is included with TU notifications so that responses received
-from far-end servers can be routed back to the waiting downstream transaction,
-even when multiple forks are active for the same dialog-less request.
+stored response without re-invoking upper layers. The transaction layer also
+implements the SIP timers that govern server-side retransmission and expiry:
+Timer G is approximated by the background cleanup ticker and causes previously
+sent final responses (3xx–6xx) to be retransmitted with exponential backoff
+until Timer H elapses (64*T1). When an ACK is observed for a non-2xx INVITE
+response the transaction transitions into the confirmed state and swaps to
+Timer I (T4) so the retransmission loop is cancelled while still retaining the
+transaction long enough to absorb any stray ACK retransmissions. Non-INVITE
+server transactions arm Timer J (64*T1) after issuing their final response so
+cached answers remain available to satisfy request retransmissions until the
+timer fires. Timer H (and Timer J for non-INVITE flows) also act as the upper
+bound for keeping terminated transactions around, complementing the generic TTL
+eviction used for cache management.
+
+Client transactions keep the same shared data and additionally record the
+originating server transaction ID; this `serverTxID` is included with TU
+notifications so that responses received from far-end servers can be routed
+back to the waiting downstream transaction, even when multiple forks are active
+for the same dialog-less request. Client-side timers mirror RFC 3261 as well:
+INVITE transactions retransmit the request using Timer A (T1 with exponential
+backoff capped at T2) until a provisional response arrives, arm Timer B (64*T1)
+to detect upstream timeouts, and start Timer C (3 minutes) so the proxy can
+cancel stalled forks. When a non-2xx final response is forwarded upstream the
+transaction remains alive for Timer D (32 seconds) to absorb repeated final
+responses, while 2xx responses terminate immediately. Non-INVITE client
+transactions retransmit with Timer E (T1 doubling to T2), fail with Timer F
+(64*T1), and linger under Timer K (T4) after the final response so late
+retransmissions can be ignored without recreating state. Timer expirations now
+generate the expected 408 responses towards downstream transactions and Timer C
+causes an automatic CANCEL to be issued upstream before notifying the TU.
+
+To prevent unbounded growth of the server transaction cache, each entry now
+expires after roughly one SIP timer cycle (64*T1). A background ticker in the
+transaction layer periodically evicts expired transactions, ensuring memory is
+returned once retransmissions cease while still allowing duplicates to be
+answered from the cached response during the retention window.
 
 ## Proxy Core Behaviour
 

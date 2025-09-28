@@ -33,11 +33,18 @@ func (t *inviteClientTransaction) onReceiveResponse(status int) bool {
 		return false
 	}
 	if status < 300 {
-		t.state = inviteClientTransactionStateCompleted
-	} else {
 		t.state = inviteClientTransactionStateTerminated
+		return true
 	}
-	return true
+	t.state = inviteClientTransactionStateCompleted
+	return false
+}
+
+func (t *inviteClientTransaction) onTimeout() {
+	if t == nil {
+		return
+	}
+	t.state = inviteClientTransactionStateTerminated
 }
 
 func (t *inviteClientTransaction) serverID() string {
