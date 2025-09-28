@@ -6,6 +6,7 @@ const (
 	nonInviteClientTransactionStateTrying nonInviteClientTransactionState = iota
 	nonInviteClientTransactionStateProceeding
 	nonInviteClientTransactionStateCompleted
+	nonInviteClientTransactionStateTerminated
 )
 
 type nonInviteClientTransaction struct {
@@ -32,7 +33,14 @@ func (t *nonInviteClientTransaction) onReceiveResponse(status int) bool {
 		return false
 	}
 	t.state = nonInviteClientTransactionStateCompleted
-	return true
+	return false
+}
+
+func (t *nonInviteClientTransaction) onTimeout() {
+	if t == nil {
+		return
+	}
+	t.state = nonInviteClientTransactionStateTerminated
 }
 
 func (t *nonInviteClientTransaction) serverID() string {

@@ -5,6 +5,7 @@ type inviteServerTransactionState int
 const (
 	inviteServerTransactionStateProceeding inviteServerTransactionState = iota
 	inviteServerTransactionStateCompleted
+	inviteServerTransactionStateConfirmed
 	inviteServerTransactionStateTerminated
 )
 
@@ -34,4 +35,15 @@ func (t *inviteServerTransaction) onSendResponse(status int) {
 		return
 	}
 	t.state = inviteServerTransactionStateCompleted
+}
+
+func (t *inviteServerTransaction) onReceiveAck() bool {
+	if t == nil {
+		return false
+	}
+	if t.state != inviteServerTransactionStateCompleted {
+		return false
+	}
+	t.state = inviteServerTransactionStateConfirmed
+	return true
 }
