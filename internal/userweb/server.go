@@ -1,7 +1,6 @@
-package main
+package userweb
 
 import (
-	"flag"
 	"fmt"
 	"html/template"
 	"log"
@@ -9,78 +8,83 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"time"
 
 	"xylitol4/sip/userdb"
 )
 
-type server struct {
+// Config captures the dependencies required to expose the user management web UI.
+type Config struct {
+	Store     *userdb.SQLiteStore
+	AdminUser string
+	AdminPass string
+	Logger    *log.Logger
+}
+
+// Server serves the combined administrative and self-service web interface.
+type Server struct {
 	store        *userdb.SQLiteStore
 	adminUser    string
 	adminPass    string
 	adminTmpl    *template.Template
 	passwordTmpl *template.Template
 	homeTmpl     *template.Template
+	logger       *log.Logger
 }
 
-func main() {
-	listen := flag.String("listen", ":8080", "HTTP address to listen on (host:port)")
-	userDBPath := flag.String("user-db", "", "Path to the SQLite user database")
-	adminUser := flag.String("admin-user", "", "Username required for admin endpoints")
-	adminPass := flag.String("admin-pass", "", "Password required for admin endpoints")
-	flag.Parse()
-
-	if strings.TrimSpace(*userDBPath) == "" {
-		log.Fatal("--user-db is required")
+// New constructs a Server using the provided configuration.
+func New(cfg Config) (*Server, error) {
+	if cfg.Store == nil {
+		return nil, fmt.Errorf("userweb: store is required")
 	}
-	if strings.TrimSpace(*adminUser) == "" || strings.TrimSpace(*adminPass) == "" {
-		log.Fatal("--admin-user and --admin-pass are required")
+	logger := cfg.Logger
+	if logger == nil {
+		logger = log.Default()
 	}
 
-	store, err := userdb.OpenSQLite(*userDBPath)
+	adminTmpl, err := template.New("admin").Parse(adminTemplate)
 	if err != nil {
-		log.Fatalf("failed to open user database: %v", err)
+		return nil, fmt.Errorf("userweb: parse admin template: %w", err)
 	}
-	defer store.Close()
-
-	srv := &server{
-		store:        store,
-		adminUser:    *adminUser,
-		adminPass:    *adminPass,
-		adminTmpl:    template.Must(template.New("admin").Parse(adminTemplate)),
-		passwordTmpl: template.Must(template.New("password").Parse(passwordTemplate)),
-		homeTmpl:     template.Must(template.New("home").Parse(homeTemplate)),
+	passwordTmpl, err := template.New("password").Parse(passwordTemplate)
+	if err != nil {
+		return nil, fmt.Errorf("userweb: parse password template: %w", err)
+	}
+	homeTmpl, err := template.New("home").Parse(homeTemplate)
+	if err != nil {
+		return nil, fmt.Errorf("userweb: parse home template: %w", err)
 	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", srv.handleHome)
-	mux.HandleFunc("/admin/users", srv.basicAuth(srv.handleAdminUsers))
-	mux.HandleFunc("/password", srv.handlePassword)
-
-	server := &http.Server{
-		Addr:         *listen,
-		Handler:      mux,
-		ReadTimeout:  5 * time.Second,
-		WriteTimeout: 10 * time.Second,
-	}
-
-	log.Printf("user web interface listening on %s", *listen)
-	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("http server failed: %v", err)
-	}
+	return &Server{
+		store:        cfg.Store,
+		adminUser:    cfg.AdminUser,
+		adminPass:    cfg.AdminPass,
+		adminTmpl:    adminTmpl,
+		passwordTmpl: passwordTmpl,
+		homeTmpl:     homeTmpl,
+		logger:       logger,
+	}, nil
 }
 
-func (s *server) handleHome(w http.ResponseWriter, r *http.Request) {
+// Handler returns an http.Handler wiring the user web routes.
+func (s *Server) Handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", s.handleHome)
+	mux.HandleFunc("/admin/users", s.basicAuth(s.handleAdminUsers))
+	mux.HandleFunc("/password", s.handlePassword)
+	return mux
+}
+
+func (s *Server) handleHome(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	if err := s.homeTmpl.Execute(w, nil); err != nil {
-		log.Printf("render home: %v", err)
+		s.logger.Printf("render home: %v", err)
 	}
 }
 
-func (s *server) basicAuth(next http.HandlerFunc) http.HandlerFunc {
+func (s *Server) basicAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user, pass, ok := r.BasicAuth()
 		if !ok || !s.authorisedAdmin(user, pass) {
@@ -92,7 +96,7 @@ func (s *server) basicAuth(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-func (s *server) authorisedAdmin(user, pass string) bool {
+func (s *Server) authorisedAdmin(user, pass string) bool {
 	return subtleCompare(user, s.adminUser) && subtleCompare(pass, s.adminPass)
 }
 
@@ -114,7 +118,7 @@ type adminTemplateData struct {
 	Error          string
 }
 
-func (s *server) handleAdminUsers(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleAdminUsers(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	data := adminTemplateData{}
 
@@ -150,7 +154,7 @@ func (s *server) handleAdminUsers(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				data.Error = fmt.Sprintf("ユーザ作成に失敗しました: %v", err)
 			} else {
-				data.Message = fmt.Sprintf("ユーザ %s@%s を登録しました", username, domain)
+				data.Message = fmt.Sprintf("ユーザ %s@%s を登録ました", username, domain)
 			}
 		case "delete":
 			username := strings.TrimSpace(r.FormValue("username"))
@@ -247,7 +251,7 @@ func (s *server) handleAdminUsers(w http.ResponseWriter, r *http.Request) {
 	data.BroadcastRules = rules
 
 	if err := s.adminTmpl.Execute(w, data); err != nil {
-		log.Printf("render admin: %v", err)
+		s.logger.Printf("render admin: %v", err)
 	}
 }
 
@@ -256,7 +260,7 @@ type passwordTemplateData struct {
 	Error   string
 }
 
-func (s *server) handlePassword(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handlePassword(w http.ResponseWriter, r *http.Request) {
 	data := passwordTemplateData{}
 	switch r.Method {
 	case http.MethodGet:
@@ -309,7 +313,7 @@ func (s *server) handlePassword(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.passwordTmpl.Execute(w, data); err != nil {
-		log.Printf("render password: %v", err)
+		s.logger.Printf("render password: %v", err)
 	}
 }
 
@@ -410,10 +414,10 @@ const adminTemplate = `<!DOCTYPE html>
                 <button type="submit">削除</button>
         </form>
 
-        <h2>ブロードキャストルール一覧</h2>
+        <h2>ブロードキャストルール</h2>
         <table>
                 <thead>
-                        <tr><th>ID</th><th>アドレス</th><th>説明</th><th>宛先URI</th></tr>
+                        <tr><th>ID</th><th>Address</th><th>Description</th><th>Targets</th></tr>
                 </thead>
                 <tbody>
                         {{range .BroadcastRules}}
@@ -421,45 +425,45 @@ const adminTemplate = `<!DOCTYPE html>
                                 <td>{{.ID}}</td>
                                 <td>{{.Address}}</td>
                                 <td>{{.Description}}</td>
-                                <td>{{range $i, $t := .Targets}}{{if $i}}, {{end}}{{$t.ContactURI}}{{end}}</td>
+                                <td>
+                                        {{range .Targets}}
+                                        <div>{{.ContactURI}}</div>
+                                        {{else}}
+                                        <div>(なし)</div>
+                                        {{end}}
+                                </td>
                         </tr>
                         {{else}}
-                        <tr><td colspan="4">登録されたブロードキャストルールはありません</td></tr>
+                        <tr><td colspan="4">登録されたルールはありません</td></tr>
                         {{end}}
                 </tbody>
         </table>
 
-        <h3>新規ブロードキャストルール</h3>
+        <h2>ブロードキャストルール作成</h2>
         <form method="post">
                 <input type="hidden" name="action" value="broadcast-create">
-                <label>アドレス: <input type="text" name="broadcast_address" required></label><br>
-                <label>説明 (任意): <input type="text" name="broadcast_description"></label><br>
-                <label>宛先URI (改行またはカンマ区切り):<br>
-                        <textarea name="broadcast_targets" rows="4" cols="60" placeholder="sip:alice@example.com&#10;sip:bob@example.com"></textarea>
-                </label><br>
+                <label>Address: <input type="text" name="broadcast_address" required></label><br>
+                <label>Description: <input type="text" name="broadcast_description"></label><br>
+                <label>Targets (改行・カンマ区切り):<br><textarea name="broadcast_targets" rows="4" cols="40"></textarea></label><br>
                 <button type="submit">作成</button>
         </form>
 
-        <h3>既存ルールの更新</h3>
+        <h2>ブロードキャストルール更新</h2>
         <form method="post">
                 <input type="hidden" name="action" value="broadcast-update">
-                <label>ルールID: <input type="number" name="broadcast_id" min="1" required></label><br>
-                <label>アドレス: <input type="text" name="broadcast_address" required></label><br>
-                <label>説明 (任意): <input type="text" name="broadcast_description"></label><br>
-                <label>宛先URI一覧 (改行またはカンマ区切りで再指定):<br>
-                        <textarea name="broadcast_targets" rows="4" cols="60" placeholder="sip:alice@example.com&#10;sip:bob@example.com"></textarea>
-                </label><br>
+                <label>ID: <input type="number" name="broadcast_id" min="1" required></label><br>
+                <label>Address: <input type="text" name="broadcast_address" required></label><br>
+                <label>Description: <input type="text" name="broadcast_description"></label><br>
+                <label>Targets (改行・カンマ区切り):<br><textarea name="broadcast_targets" rows="4" cols="40"></textarea></label><br>
                 <button type="submit">更新</button>
         </form>
 
-        <h3>ブロードキャストルール削除</h3>
+        <h2>ブロードキャストルール削除</h2>
         <form method="post">
                 <input type="hidden" name="action" value="broadcast-delete">
-                <label>ルールID: <input type="number" name="broadcast_id" min="1" required></label><br>
+                <label>ID: <input type="number" name="broadcast_id" min="1" required></label><br>
                 <button type="submit">削除</button>
         </form>
-
-        <p><a href="/">ポータルトップへ戻る</a></p>
 </body>
 </html>`
 
@@ -471,7 +475,8 @@ const passwordTemplate = `<!DOCTYPE html>
         <style>
                 body { font-family: sans-serif; margin: 2rem; }
                 form { max-width: 400px; }
-                label { display: block; margin-top: 1rem; }
+                label { display: block; margin-bottom: 0.5rem; }
+                input { width: 100%; padding: 0.4rem; margin-top: 0.2rem; }
                 .message { color: green; }
                 .error { color: red; }
         </style>
@@ -481,13 +486,13 @@ const passwordTemplate = `<!DOCTYPE html>
         {{if .Message}}<p class="message">{{.Message}}</p>{{end}}
         {{if .Error}}<p class="error">{{.Error}}</p>{{end}}
         <form method="post">
-                <label>ユーザ名: <input type="text" name="username" required></label>
-                <label>ドメイン: <input type="text" name="domain" required></label>
-                <label>現在のパスワード: <input type="password" name="current_password"></label>
-                <label>新しいパスワード: <input type="password" name="new_password" required></label>
-                <label>新しいパスワード(確認): <input type="password" name="confirm_password" required></label>
-                <button type="submit">更新</button>
+                <label>ユーザ名<input type="text" name="username" required></label>
+                <label>ドメイン<input type="text" name="domain" required></label>
+                <label>現在のパスワード<input type="password" name="current_password"></label>
+                <label>新しいパスワード<input type="password" name="new_password" required></label>
+                <label>新しいパスワード(確認)<input type="password" name="confirm_password" required></label>
+                <button type="submit">変更</button>
         </form>
-        <p><a href="/">ポータルトップへ戻る</a></p>
+        <a href="/">戻る</a>
 </body>
 </html>`
