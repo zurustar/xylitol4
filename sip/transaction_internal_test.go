@@ -247,6 +247,68 @@ func TestInviteClientTransactionTimerBGeneratesTimeout(t *testing.T) {
 	}
 }
 
+func TestInviteClientTransactionCancelsTimerBAfterProvisional(t *testing.T) {
+	ctx := context.Background()
+	toTransport := make(chan transportEvent, 10)
+	toTU := make(chan tuEvent, 10)
+	layer := newTransactionLayer(nil, toTransport, toTU, nil)
+	layer.timerAInitial = time.Millisecond
+	layer.timerAMax = 2 * time.Millisecond
+	layer.timerBDuration = 6 * time.Millisecond
+	layer.timerCDuration = 50 * time.Millisecond
+
+	invite := newInvite()
+	branch := newBranchID()
+	prependVia(invite, branch)
+	key := transactionKey(branch, "INVITE")
+	action := tuAction{Kind: tuActionForwardRequest, ServerTxID: "down", ClientTxID: key, Message: invite}
+
+	layer.handleTUAction(ctx, action)
+	forwarded, ok := <-toTransport
+	if !ok || forwarded.Message == nil {
+		t.Fatalf("expected forwarded invite")
+	}
+
+	ringing := buildResponseFrom(forwarded.Message, 180, "Ringing")
+	layer.handleResponse(ctx, transportEvent{Direction: directionUpstream, Message: ringing})
+
+	entry, ok := layer.clientTxns[key]
+	if !ok {
+		t.Fatalf("expected invite transaction to remain after provisional response")
+	}
+	if !entry.deadline.IsZero() {
+		t.Fatalf("expected timer B deadline to be cleared after provisional response")
+	}
+
+	select {
+	case evt := <-toTU:
+		if evt.Message == nil || evt.Message.StatusCode != 180 {
+			t.Fatalf("expected provisional response to reach TU, got %#v", evt.Message)
+		}
+	default:
+		t.Fatalf("expected TU notification for provisional response")
+	}
+
+	time.Sleep(7 * time.Millisecond)
+	layer.cleanupTransactions(ctx, time.Now())
+
+	if _, ok := layer.clientTxns[key]; !ok {
+		t.Fatalf("expected invite transaction to persist until timer C expiry")
+	}
+
+	if len(toTU) != 0 {
+		t.Fatalf("unexpected additional TU notifications after provisional response")
+	}
+
+	select {
+	case evt := <-toTransport:
+		if evt.Message != nil && strings.EqualFold(evt.Message.Method, "CANCEL") {
+			t.Fatalf("unexpected CANCEL generated after provisional response")
+		}
+	default:
+	}
+}
+
 func TestInviteClientTransactionTimerDTerminatesAfterFinal(t *testing.T) {
 	ctx := context.Background()
 	toTransport := make(chan transportEvent, 10)

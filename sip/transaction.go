@@ -282,6 +282,7 @@ func (t *transactionLayer) handleResponse(ctx context.Context, evt transportEven
 	now := time.Now()
 	switch txn.(type) {
 	case *inviteClientTransaction:
+		entry.deadline = time.Time{}
 		entry.retransmitAt = time.Time{}
 		entry.retransmitInterval = 0
 		if status < 200 {
@@ -293,7 +294,6 @@ func (t *transactionLayer) handleResponse(ctx context.Context, evt transportEven
 			t.clientTxns[key] = entry
 			break
 		}
-		entry.deadline = time.Time{}
 		entry.timerCDeadline = time.Time{}
 		if status < 300 {
 			delete(t.clientTxns, key)
