@@ -100,8 +100,9 @@ back to the waiting downstream transaction, even when multiple forks are active
 for the same dialog-less request. Client-side timers mirror RFC 3261 as well:
 INVITE transactions retransmit the request using Timer A (T1 with exponential
 backoff capped at T2) until a provisional response arrives, arm Timer B (64*T1)
-to detect upstream timeouts, and start Timer C (3 minutes) so the proxy can
-cancel stalled forks. When a non-2xx final response is forwarded upstream the
+to detect upstream timeouts—cancelling it as soon as the first provisional
+response is observed—and start Timer C (3 minutes) so the proxy can cancel
+stalled forks. When a non-2xx final response is forwarded upstream the
 transaction remains alive for Timer D (32 seconds) to absorb repeated final
 responses, while 2xx responses terminate immediately. Non-INVITE client
 transactions retransmit with Timer E (T1 doubling to T2), fail with Timer F
