@@ -190,8 +190,9 @@ type memoryDatabase struct {
 }
 
 type memoryTable struct {
-	columns []string
-	rows    []map[string]string
+	columns       []string
+	rows          []map[string]string
+	autoIncrement int64
 }
 
 func newMemoryDatabase() *memoryDatabase {
@@ -223,9 +224,28 @@ func (db *memoryDatabase) insertRow(stmt insertStmt) error {
 		for i, col := range stmt.columns {
 			row[col] = vals[i]
 		}
+		if table.hasColumn("id") {
+			if raw, ok := row["id"]; ok {
+				if n, err := strconv.ParseInt(raw, 10, 64); err == nil && n > table.autoIncrement {
+					table.autoIncrement = n
+				}
+			} else {
+				table.autoIncrement++
+				row["id"] = strconv.FormatInt(table.autoIncrement, 10)
+			}
+		}
 		table.rows = append(table.rows, row)
 	}
 	return nil
+}
+
+func (t *memoryTable) hasColumn(name string) bool {
+	for _, col := range t.columns {
+		if strings.EqualFold(col, name) {
+			return true
+		}
+	}
+	return false
 }
 
 func (db *memoryDatabase) updateRows(stmt updateStmt, setValues, whereValues []string) (int64, error) {

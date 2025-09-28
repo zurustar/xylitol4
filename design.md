@@ -170,6 +170,18 @@ directory entries for logging/validation, and keeps the handle available for the
 transaction user. This guarantees that future registrar features can rely on the
 database being available before any network traffic is processed.
 
+### Broadcast Ringing Configuration
+
+To support simultaneous ringing, the user directory now tracks **broadcast
+rules** in addition to standard user records. Each rule captures the address of
+record that should trigger a broadcast (for example, `sip:sales@example.com`) and
+stores the ordered list of downstream contact URIs that must be called in
+parallel. The new `BroadcastRule`/`BroadcastTarget` types in `sip/userdb` expose
+CRUD helpers so administrative tooling can create, update, and delete these
+mappings. Consumers load the rules at runtime through `ListBroadcastRules` or
+`LookupBroadcastTargets`, ensuring the proxy can discover all destinations that
+must be forked when an INVITE arrives for a broadcast-enabled address.
+
 ## Registrar Behaviour
 
 The proxy embeds an optional registrar that can be supplied at construction time
