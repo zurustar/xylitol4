@@ -237,19 +237,19 @@ REGISTER handling. These responsibilities now live inside the `SIPStack` type in
 registrar-backed proxy, and supervises the worker goroutines that bridge the network
 with the queue-based proxy API. The stack also owns the TTL-based `transactionRouter`
 used to remember downstream routes and runs the periodic cleanup loop that prunes
-expired entries.
+expired entries. Additional flags (`--http-listen`, `--admin-user`, and
+`--admin-pass`) enable the web UI to be served from the same binary; when supplied,
+the command opens a second SQLite handle dedicated to HTTP traffic and wires the
+templates exposed by `internal/userweb` into an `http.Server`.
 
-`main.go` is reduced to flag parsing, signal handling, and lifecycle control. It
-constructs a `SIPStack`, calls `Start` with the signal-aware context, waits for that
-context to be cancelled, and then invokes `Stop` to shut down the proxy cleanly. By
-keeping signal handling in `main` but centralising the rest of the runtime wiring in
-the stack, the command remains small while the collaborating components stay tightly
-coordinated.
+`main.go` continues to own flag parsing and signal handling but now orchestrates two
+long-running services. It constructs a `SIPStack`, calls `Start` with the
+signal-aware context, and then, if administrative credentials were provided, starts
+the HTTP server in its own goroutine while monitoring an error channel. Shutdown is
+coordinated across both subsystems by cancelling the shared context, invoking
+`http.Server.Shutdown` with a timeout, and finally calling `SIPStack.Stop` so the
+proxy and the web UI exit cleanly together.
 
 ## Web管理インタフェース
 
-SQLiteベースのユーザディレクトリを直接操作できるWeb UIを`cmd/user-web`コマンドとして追加した。HTTP Basic認証で保護された`/admin/users`
-エンドポイントではユーザ一覧の表示、初期パスワードやContact URIを指定したユーザ登録、既存ユーザの削除をフォームで提供する。これらの操
-作は`sip/userdb.SQLiteStore`に追加した`CreateUser`/`DeleteUser`/`UpdatePassword`メソッド経由で実行される。利用者向けの`/password`エン
-ドポイントでは現在のパスワードを検証したうえで`HashPassword`/`VerifyPassword`ヘルパーを用いて新しいパスワードをHA1ダイジェストとして保
-存する。テンプレートは`html/template`で組み込み、一覧はドメイン・ユーザ名順にソートして表示する。
+SQLiteベースのユーザディレクトリを直接操作できるWeb UIは`internal/userweb`パッケージにまとまり、`cmd/sip-proxy`から同一プロセスで利用される。HTTP Basic認証で保護された`/admin/users`エンドポイントではユーザ一覧の表示、初期パスワードやContact URIを指定したユーザ登録、既存ユーザの削除をフォームで提供する。これらの操作は`sip/userdb.SQLiteStore`に追加した`CreateUser`/`DeleteUser`/`UpdatePassword`メソッド経由で実行される。利用者向けの`/password`エンドポイントでは現在のパスワードを検証したうえで`HashPassword`/`VerifyPassword`ヘルパーを用いて新しいパスワードをHA1ダイジェストとして保存する。テンプレートは`html/template`で組み込み、一覧はドメイン・ユーザ名順にソートして表示する。SIPスタックとは別のSQLite接続を開いた上でHTTPサーバを起動し、プロセスの終了時に`http.Server.Shutdown`で安全に停止させることで、SIP処理とWeb UIを一括で管理できるようになった。
