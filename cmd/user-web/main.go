@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -107,9 +108,10 @@ func subtleCompare(a, b string) bool {
 }
 
 type adminTemplateData struct {
-	Users   []userdb.User
-	Message string
-	Error   string
+	Users          []userdb.User
+	BroadcastRules []userdb.BroadcastRule
+	Message        string
+	Error          string
 }
 
 func (s *server) handleAdminUsers(w http.ResponseWriter, r *http.Request) {
@@ -125,15 +127,15 @@ func (s *server) handleAdminUsers(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		action := r.FormValue("action")
-		username := strings.TrimSpace(r.FormValue("username"))
-		domain := strings.TrimSpace(r.FormValue("domain"))
-		contact := strings.TrimSpace(r.FormValue("contact"))
-		if username == "" || domain == "" {
-			data.Error = "ユーザ名とドメインを入力してください"
-			break
-		}
 		switch action {
 		case "create":
+			username := strings.TrimSpace(r.FormValue("username"))
+			domain := strings.TrimSpace(r.FormValue("domain"))
+			contact := strings.TrimSpace(r.FormValue("contact"))
+			if username == "" || domain == "" {
+				data.Error = "ユーザ名とドメインを入力してください"
+				break
+			}
 			password := r.FormValue("password")
 			var hash string
 			if password != "" {
@@ -151,10 +153,70 @@ func (s *server) handleAdminUsers(w http.ResponseWriter, r *http.Request) {
 				data.Message = fmt.Sprintf("ユーザ %s@%s を登録しました", username, domain)
 			}
 		case "delete":
+			username := strings.TrimSpace(r.FormValue("username"))
+			domain := strings.TrimSpace(r.FormValue("domain"))
+			if username == "" || domain == "" {
+				data.Error = "ユーザ名とドメインを入力してください"
+				break
+			}
 			if err := s.store.DeleteUser(ctx, username, domain); err != nil {
 				data.Error = fmt.Sprintf("ユーザ削除に失敗しました: %v", err)
 			} else {
 				data.Message = fmt.Sprintf("ユーザ %s@%s を削除しました", username, domain)
+			}
+		case "broadcast-create":
+			address := strings.TrimSpace(r.FormValue("broadcast_address"))
+			description := strings.TrimSpace(r.FormValue("broadcast_description"))
+			targets := parseBroadcastTargets(r.FormValue("broadcast_targets"))
+			if address == "" {
+				data.Error = "ブロードキャスト対象アドレスを入力してください"
+				break
+			}
+			_, err := s.store.CreateBroadcastRule(ctx, userdb.BroadcastRule{
+				Address:     address,
+				Description: description,
+				Targets:     targets,
+			})
+			if err != nil {
+				data.Error = fmt.Sprintf("ブロードキャストルールの作成に失敗しました: %v", err)
+			} else {
+				data.Message = fmt.Sprintf("%s のブロードキャストルールを作成しました", address)
+			}
+		case "broadcast-update":
+			idStr := strings.TrimSpace(r.FormValue("broadcast_id"))
+			id, err := strconv.ParseInt(idStr, 10, 64)
+			if err != nil || id <= 0 {
+				data.Error = "更新対象のルールIDが正しくありません"
+				break
+			}
+			address := strings.TrimSpace(r.FormValue("broadcast_address"))
+			description := strings.TrimSpace(r.FormValue("broadcast_description"))
+			targets := parseBroadcastTargets(r.FormValue("broadcast_targets"))
+			if address == "" {
+				data.Error = "ブロードキャスト対象アドレスを入力してください"
+				break
+			}
+			update := userdb.BroadcastRule{ID: id, Address: address, Description: description}
+			if err := s.store.UpdateBroadcastRule(ctx, update); err != nil {
+				data.Error = fmt.Sprintf("ブロードキャストルールの更新に失敗しました: %v", err)
+				break
+			}
+			if err := s.store.ReplaceBroadcastTargets(ctx, id, targets); err != nil {
+				data.Error = fmt.Sprintf("宛先URIの更新に失敗しました: %v", err)
+				break
+			}
+			data.Message = fmt.Sprintf("ルールID %d を更新しました", id)
+		case "broadcast-delete":
+			idStr := strings.TrimSpace(r.FormValue("broadcast_id"))
+			id, err := strconv.ParseInt(idStr, 10, 64)
+			if err != nil || id <= 0 {
+				data.Error = "削除対象のルールIDが正しくありません"
+				break
+			}
+			if err := s.store.DeleteBroadcastRule(ctx, id); err != nil {
+				data.Error = fmt.Sprintf("ブロードキャストルールの削除に失敗しました: %v", err)
+			} else {
+				data.Message = fmt.Sprintf("ルールID %d を削除しました", id)
 			}
 		default:
 			data.Error = "不明な操作が指定されました"
@@ -176,6 +238,13 @@ func (s *server) handleAdminUsers(w http.ResponseWriter, r *http.Request) {
 		return users[i].Domain < users[j].Domain
 	})
 	data.Users = users
+
+	rules, err := s.store.ListBroadcastRules(ctx)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to list broadcast rules: %v", err), http.StatusInternalServerError)
+		return
+	}
+	data.BroadcastRules = rules
 
 	if err := s.adminTmpl.Execute(w, data); err != nil {
 		log.Printf("render admin: %v", err)
@@ -242,6 +311,31 @@ func (s *server) handlePassword(w http.ResponseWriter, r *http.Request) {
 	if err := s.passwordTmpl.Execute(w, data); err != nil {
 		log.Printf("render password: %v", err)
 	}
+}
+
+func parseBroadcastTargets(raw string) []userdb.BroadcastTarget {
+	var targets []userdb.BroadcastTarget
+	if strings.TrimSpace(raw) == "" {
+		return targets
+	}
+	parts := strings.FieldsFunc(raw, func(r rune) bool {
+		switch r {
+		case '\n', '\r', ',', ';':
+			return true
+		default:
+			return false
+		}
+	})
+	order := 0
+	for _, part := range parts {
+		contact := strings.TrimSpace(part)
+		if contact == "" {
+			continue
+		}
+		targets = append(targets, userdb.BroadcastTarget{ContactURI: contact, Priority: order})
+		order++
+	}
+	return targets
 }
 
 const homeTemplate = `<!DOCTYPE html>
@@ -313,6 +407,55 @@ const adminTemplate = `<!DOCTYPE html>
                 <input type="hidden" name="action" value="delete">
                 <label>ユーザ名: <input type="text" name="username" required></label><br>
                 <label>ドメイン: <input type="text" name="domain" required></label><br>
+                <button type="submit">削除</button>
+        </form>
+
+        <h2>ブロードキャストルール一覧</h2>
+        <table>
+                <thead>
+                        <tr><th>ID</th><th>アドレス</th><th>説明</th><th>宛先URI</th></tr>
+                </thead>
+                <tbody>
+                        {{range .BroadcastRules}}
+                        <tr>
+                                <td>{{.ID}}</td>
+                                <td>{{.Address}}</td>
+                                <td>{{.Description}}</td>
+                                <td>{{range $i, $t := .Targets}}{{if $i}}, {{end}}{{$t.ContactURI}}{{end}}</td>
+                        </tr>
+                        {{else}}
+                        <tr><td colspan="4">登録されたブロードキャストルールはありません</td></tr>
+                        {{end}}
+                </tbody>
+        </table>
+
+        <h3>新規ブロードキャストルール</h3>
+        <form method="post">
+                <input type="hidden" name="action" value="broadcast-create">
+                <label>アドレス: <input type="text" name="broadcast_address" required></label><br>
+                <label>説明 (任意): <input type="text" name="broadcast_description"></label><br>
+                <label>宛先URI (改行またはカンマ区切り):<br>
+                        <textarea name="broadcast_targets" rows="4" cols="60" placeholder="sip:alice@example.com&#10;sip:bob@example.com"></textarea>
+                </label><br>
+                <button type="submit">作成</button>
+        </form>
+
+        <h3>既存ルールの更新</h3>
+        <form method="post">
+                <input type="hidden" name="action" value="broadcast-update">
+                <label>ルールID: <input type="number" name="broadcast_id" min="1" required></label><br>
+                <label>アドレス: <input type="text" name="broadcast_address" required></label><br>
+                <label>説明 (任意): <input type="text" name="broadcast_description"></label><br>
+                <label>宛先URI一覧 (改行またはカンマ区切りで再指定):<br>
+                        <textarea name="broadcast_targets" rows="4" cols="60" placeholder="sip:alice@example.com&#10;sip:bob@example.com"></textarea>
+                </label><br>
+                <button type="submit">更新</button>
+        </form>
+
+        <h3>ブロードキャストルール削除</h3>
+        <form method="post">
+                <input type="hidden" name="action" value="broadcast-delete">
+                <label>ルールID: <input type="number" name="broadcast_id" min="1" required></label><br>
                 <button type="submit">削除</button>
         </form>
 

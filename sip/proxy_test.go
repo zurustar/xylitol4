@@ -128,6 +128,139 @@ func TestProxyNonInviteTransactionRetransmission(t *testing.T) {
 	}
 }
 
+func TestProxyBroadcastFirstResponseWins(t *testing.T) {
+	policy := NewBroadcastPolicy([]BroadcastRule{{
+		Address: "sip:team@example.com",
+		Targets: []string{"sip:alice@example.com", "sip:bob@example.com"},
+	}})
+	proxy := NewProxy(WithBroadcastPolicy(policy))
+	t.Cleanup(proxy.Stop)
+
+	invite := newInvite()
+	invite.RequestURI = "sip:team@example.com"
+	proxy.SendFromClient(invite)
+
+	first, ok := proxy.NextToServer(100 * time.Millisecond)
+	if !ok {
+		t.Fatalf("expected first forked request")
+	}
+	if first.RequestURI != "sip:alice@example.com" {
+		t.Fatalf("unexpected first target: %s", first.RequestURI)
+	}
+
+	second, ok := proxy.NextToServer(100 * time.Millisecond)
+	if !ok {
+		t.Fatalf("expected second forked request")
+	}
+	if second.RequestURI != "sip:bob@example.com" {
+		t.Fatalf("unexpected second target: %s", second.RequestURI)
+	}
+
+	ringing := buildResponseFrom(first, 180, "Ringing")
+	proxy.SendFromServer(ringing)
+
+	downstream, ok := proxy.NextToClient(100 * time.Millisecond)
+	if !ok || downstream.StatusCode != 180 {
+		t.Fatalf("expected provisional response downstream")
+	}
+
+	okResp := buildResponseFrom(first, 200, "OK")
+	proxy.SendFromServer(okResp)
+
+	final, ok := proxy.NextToClient(100 * time.Millisecond)
+	if !ok || final.StatusCode != 200 {
+		t.Fatalf("expected 200 OK downstream, got %+v", final)
+	}
+
+	cancel, ok := proxy.NextToServer(100 * time.Millisecond)
+	if !ok {
+		t.Fatalf("expected CANCEL for remaining fork")
+	}
+	if cancel.Method != "CANCEL" {
+		t.Fatalf("expected CANCEL, got %s", cancel.Method)
+	}
+	if cancel.RequestURI != "sip:bob@example.com" {
+		t.Fatalf("unexpected CANCEL target: %s", cancel.RequestURI)
+	}
+
+	lateOK := buildResponseFrom(second, 200, "OK")
+	proxy.SendFromServer(lateOK)
+
+	bye, ok := proxy.NextToServer(100 * time.Millisecond)
+	if !ok || bye.Method != "BYE" {
+		t.Fatalf("expected BYE for late OK, got %+v", bye)
+	}
+
+	terminated := buildResponseFrom(second, 487, "Request Terminated")
+	proxy.SendFromServer(terminated)
+
+	if msg, ok := proxy.NextToClient(50 * time.Millisecond); ok {
+		t.Fatalf("unexpected downstream message after completion: %+v", msg)
+	}
+}
+
+func TestProxyBroadcastAggregatesFailures(t *testing.T) {
+	policy := NewBroadcastPolicy([]BroadcastRule{{
+		Address: "sip:support@example.com",
+		Targets: []string{"sip:alice@example.com", "sip:bob@example.com"},
+	}})
+	proxy := NewProxy(WithBroadcastPolicy(policy))
+	t.Cleanup(proxy.Stop)
+
+	invite := newInvite()
+	invite.RequestURI = "sip:support@example.com"
+	proxy.SendFromClient(invite)
+
+	first, ok := proxy.NextToServer(100 * time.Millisecond)
+	if !ok {
+		t.Fatalf("expected first fork request")
+	}
+	second, ok := proxy.NextToServer(100 * time.Millisecond)
+	if !ok {
+		t.Fatalf("expected second fork request")
+	}
+
+	unavailable := buildResponseFrom(first, 480, "Temporarily Unavailable")
+	proxy.SendFromServer(unavailable)
+
+	failure := buildResponseFrom(second, 503, "Service Unavailable")
+	proxy.SendFromServer(failure)
+
+	final, ok := proxy.NextToClient(100 * time.Millisecond)
+	if !ok {
+		t.Fatalf("expected aggregated failure downstream")
+	}
+	if final.StatusCode != 503 {
+		t.Fatalf("expected 503 aggregation, got %d", final.StatusCode)
+	}
+	if msg, ok := proxy.NextToClient(50 * time.Millisecond); ok {
+		t.Fatalf("unexpected extra downstream message: %+v", msg)
+	}
+}
+
+func TestProxyBroadcastNoTargetsResponds404(t *testing.T) {
+	policy := NewBroadcastPolicy([]BroadcastRule{{
+		Address: "sip:info@example.com",
+	}})
+	proxy := NewProxy(WithBroadcastPolicy(policy))
+	t.Cleanup(proxy.Stop)
+
+	invite := newInvite()
+	invite.RequestURI = "sip:info@example.com"
+	proxy.SendFromClient(invite)
+
+	resp, ok := proxy.NextToClient(100 * time.Millisecond)
+	if !ok {
+		t.Fatalf("expected immediate response for empty broadcast rule")
+	}
+	if resp.StatusCode != 404 {
+		t.Fatalf("expected 404 response, got %d", resp.StatusCode)
+	}
+	if _, ok := proxy.NextToServer(50 * time.Millisecond); ok {
+		t.Fatalf("no upstream request should be generated")
+	}
+}
+
 func buildResponseFrom(req *Message, status int, reason string) *Message {
 	resp := NewResponse(status, reason)
 	if req != nil {

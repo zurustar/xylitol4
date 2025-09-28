@@ -182,6 +182,26 @@ mappings. Consumers load the rules at runtime through `ListBroadcastRules` or
 `LookupBroadcastTargets`, ensuring the proxy can discover all destinations that
 must be forked when an INVITE arrives for a broadcast-enabled address.
 
+When the SIP stack boots it now pulls every broadcast rule from SQLite, converts
+them into the in-memory `BroadcastPolicy`, and wires the policy into the proxy
+via `sip.WithBroadcastPolicy`. The transaction user consults this policy whenever
+an INVITE arrives: if the Request-URI matches a broadcast address, it clones the
+request for each contact, assigns a unique branch identifier, and forwards every
+fork upstream in parallel while tracking the per-branch state inside a
+`broadcastSession`. The session records provisional responses, forwards the first
+2xx back downstream, and immediately emits CANCEL requests for the losing forks.
+Late 2xx answers trigger a best-effort BYE so the remote leg tears down cleanly,
+and failure responses are aggregated so the caller eventually receives the most
+informative final status when no branch succeeds. CANCEL requests coming from the
+downstream caller are also fanned out to every active fork, and the proxy caches
+the best failure response until all branches complete before replying with 487.
+
+The management portal (`cmd/user-web`) gained new panels for broadcast ringing.
+Administrators can list existing rules, create new address-to-target mappings,
+replace a rule's contact list in bulk, or delete unused entries. Targets are
+entered as newline or comma separated SIP URIs and are persisted in priority
+order so the runtime policy preserves the configured ringing sequence.
+
 ## Registrar Behaviour
 
 The proxy embeds an optional registrar that can be supplied at construction time
